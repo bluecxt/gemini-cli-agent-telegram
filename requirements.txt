@@ -1,0 +1,3 @@
+python-telegram-bot --pre
+python-dotenv
+# No uvicorn/fastapi needed as we removed the dashboard

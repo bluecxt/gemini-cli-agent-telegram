@@ -1,0 +1,20 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Project local data (Persistent volumes)
+data/
+logs/
+tmp/
+workspace/
+repos/
+skills/
+gemini_config/

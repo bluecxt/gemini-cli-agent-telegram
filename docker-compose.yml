@@ -1,0 +1,20 @@
+version: "3.8"
+
+services:
+    gemini-bot:
+        build: .
+        container_name: gemini_agent
+        restart: unless-stopped
+        volumes:
+            - ./logs:/app/logs
+            - ./data:/app/data
+            - ./tmp:/app/tmp
+            - ./skills:/app/skills
+            - ./workspace:/app/workspace
+            - ./.env:/app/.env
+            # On persiste les sessions et les credentials de gemini-cli
+            - ./gemini_config:/root/.gemini
+        env_file:
+            - .env
+        environment:
+            - PYTHONUNBUFFERED=1
