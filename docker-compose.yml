@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
     gemini-bot:
         build: .
@@ -15,6 +13,9 @@ services:
             - ./GEMINI.md:/app/GEMINI.md
             # Sessions and credentials persisted in the .gemini hidden folder
             - ./.gemini:/root/.gemini
+            # Sync time with host
+            - /etc/localtime:/etc/localtime:ro
+            - /etc/timezone:/etc/timezone:ro
         env_file:
             - .env
         environment:
