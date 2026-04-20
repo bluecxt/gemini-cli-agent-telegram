@@ -74,11 +74,17 @@ def _format_html_response(text: str) -> str:
         return ""
 
     """ 1. Robust thinking removal """
+    # Remove <thinking>...</thinking>
     clean_text = re.sub(
         r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL
     )
+    # Remove any unclosed <thinking>
     clean_text = re.sub(
         r"<thinking>.*$", "", clean_text, flags=re.DOTALL
+    )
+    # Remove [Thought: ...] blocks
+    clean_text = re.sub(
+        r"\[Thought:.*?\]", "", clean_text, flags=re.DOTALL
     ).strip()
 
     if not clean_text:
