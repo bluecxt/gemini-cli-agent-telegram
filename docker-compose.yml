@@ -12,8 +12,9 @@ services:
             - ./skills:/app/skills
             - ./workspace:/app/workspace
             - ./.env:/app/.env
-            # On persiste les sessions et les credentials de gemini-cli
-            - ./gemini_config:/root/.gemini
+            - ./GEMINI.md:/app/GEMINI.md
+            # Sessions and credentials persisted in the .gemini hidden folder
+            - ./.gemini:/root/.gemini
         env_file:
             - .env
         environment:

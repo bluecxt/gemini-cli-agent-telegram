@@ -17,4 +17,4 @@ tmp/
 workspace/
 repos/
 skills/
-gemini_config/
+.gemini/
