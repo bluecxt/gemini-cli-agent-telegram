@@ -82,11 +82,24 @@ def _format_html_response(text: str) -> str:
     clean_text = re.sub(
         r"<thinking>.*$", "", clean_text, flags=re.DOTALL
     )
-    # Remove [Thought: ...] blocks
+    # Remove [Thought: ...] blocks and the reasoning immediately following it
+    # We look for [Thought: true] and remove it plus any text until a clear separator or final response markers
     clean_text = re.sub(
         r"\[Thought:.*?\]", "", clean_text, flags=re.DOTALL
-    ).strip()
+    )
+    
+    # Remove common reasoning headers at the start of paragraphs
+    headers_to_strip = [
+        "Considering", "Analyzing", "Summarizing", "Thinking", 
+        "Refining", "Investigating", "Checking", "Evaluating",
+        "Determining", "Scrutinizing", "Updating", "Developing"
+    ]
+    for header in headers_to_strip:
+        # Matches "Header ... " at the start of lines/text
+        clean_text = re.sub(rf"^\s*{header}.*?\n", "", clean_text, flags=re.MULTILINE)
+        clean_text = re.sub(rf"^\s*\*\*{header}.*?\*\*.*?\n", "", clean_text, flags=re.MULTILINE)
 
+    clean_text = clean_text.strip()
     if not clean_text:
         return ""
 
@@ -187,6 +200,38 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(status, parse_mode="HTML")
 
 
+async def _send_long_message(message: Message, text: str, **kwargs):
+    """Sends a long message by splitting it into chunks safely."""
+    if not text:
+        return
+
+    limit = 4000
+    while len(text) > 0:
+        if len(text) <= limit:
+            chunk = text
+            text = ""
+        else:
+            # Try to find a good split point (newline or space)
+            split_at = text.rfind("\n", 0, limit)
+            if split_at == -1:
+                split_at = text.rfind(" ", 0, limit)
+            if split_at == -1:
+                split_at = limit
+            
+            chunk = text[:split_at]
+            text = text[split_at:].lstrip()
+
+        try:
+            await message.reply_text(chunk, **kwargs)
+        except Exception as e:
+            logger.error(f"Error sending message chunk with HTML: {e}")
+            # Fallback to plain text if HTML parsing fails
+            try:
+                await message.reply_text(chunk)
+            except Exception as e2:
+                logger.error(f"Critical error sending message chunk: {e2}")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Main message handler with live streaming updates."""
     if not update.message or is_not_user(update):
@@ -220,9 +265,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if now - last_update_time > 1.2:
                         clean_text = _format_html_response(full_response)
                         if clean_text:
+                            # Truncate live updates to avoid 'Message is too long' errors
+                            display_text = clean_text
+                            if len(display_text) > 3500:
+                                display_text = "..." + display_text[-3500:]
+
                             try:
                                 await status_msg.edit_text(
-                                    f"{clean_text} ▌", parse_mode="HTML"
+                                    f"{display_text} ▌", parse_mode="HTML"
                                 )
                                 last_update_time = now
                             except Exception:
@@ -273,9 +323,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         final_text = _format_html_response(full_response)
         if final_text:
             try:
-                await status_msg.edit_text(final_text, parse_mode="HTML")
-            except Exception:
-                await update.message.reply_text(final_text, parse_mode="HTML")
+                if len(final_text) < 4000:
+                    await status_msg.edit_text(final_text, parse_mode="HTML")
+                else:
+                    await status_msg.delete()
+                    await _send_long_message(update.message, final_text, parse_mode="HTML")
+            except Exception as e:
+                logger.error(f"Error sending final response: {e}")
+                await _send_long_message(update.message, final_text, parse_mode="HTML")
         else:
             try:
                 await status_msg.delete()
