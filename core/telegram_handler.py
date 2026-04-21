@@ -67,34 +67,57 @@ async def _handle_attachments(message: Message) -> str:
 
 
 def _format_html_response(text: str) -> str:
-    """Cleans AI tags and converts Markdown to HTML for Telegram."""
+    """
+    Cleans AI tags and converts Markdown to HTML for Telegram.
+    Telegram HTML supports: <b>, <i>, <code>, <s>, <u>, <pre>.
+    """
     if not text:
         return ""
 
-    """ Robust thinking removal """
+    """ 1. Robust thinking removal """
+    # Remove <thinking>...</thinking>
     clean_text = re.sub(
         r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL
     )
+    # Remove any unclosed <thinking>
     clean_text = re.sub(
         r"<thinking>.*$", "", clean_text, flags=re.DOTALL
     )
+    # Remove [Thought: ...] blocks and the reasoning immediately following it
     clean_text = re.sub(
         r"\[Thought:.*?\]", "", clean_text, flags=re.DOTALL
-    ).strip()
+    )
+    
+    # Remove common reasoning headers at the start of paragraphs
+    headers_to_strip = [
+        "Considering", "Analyzing", "Summarizing", "Thinking", 
+        "Refining", "Investigating", "Checking", "Evaluating",
+        "Determining", "Scrutinizing", "Updating", "Developing"
+    ]
+    for header in headers_to_strip:
+        clean_text = re.sub(rf"^\s*{header}.*?\n", "", clean_text, flags=re.MULTILINE)
+        clean_text = re.sub(rf"^\s*\*\*{header}.*?\*\*.*?\n", "", clean_text, flags=re.MULTILINE)
 
+    clean_text = clean_text.strip()
     if not clean_text:
         return ""
 
-    """ Escape HTML and restore allowed tags """
+    """ 2. Escape basic HTML to avoid parse errors """
     clean_text = clean_text.replace("&", "&amp;")
-    clean_text = clean_text.replace("<", "&lt;").replace(">", "&gt;")
+    clean_text = clean_text.replace("<", "&lt;")
+    clean_text = clean_text.replace(">", "&gt;")
 
-    # Markdown conversion
+    """ 3. Convert Markdown to HTML """
+    # Code blocks: ```text``` -> <code>text</code>
     clean_text = re.sub(r"```(?:[\w]+)?\n?(.*?)```", r"<code>\1</code>", clean_text, flags=re.DOTALL)
+    # Bold: **text** -> <b>text</b>
     clean_text = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", clean_text)
+    # Italic: *text* -> <i>text</i>
     clean_text = re.sub(r"(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)", r"<i>\1</i>", clean_text)
+    # Inline Code: `text` -> <code>text</code>
     clean_text = re.sub(r"`(.*?)`", r"<code>\1</code>", clean_text)
 
+    """ 4. Restore tags """
     replacements = {
         "&lt;b&gt;": "<b>", "&lt;/b&gt;": "</b>",
         "&lt;i&gt;": "<i>", "&lt;/i&gt;": "</i>",
@@ -107,31 +130,61 @@ def _format_html_response(text: str) -> str:
     return clean_text
 
 
+async def _send_long_message(message_obj, text: str, **kwargs):
+    """Sends a long message by splitting it into chunks safely."""
+    if not text:
+        return
+
+    limit = 4000
+    while len(text) > 0:
+        if len(text) <= limit:
+            chunk = text
+            text = ""
+        else:
+            split_at = text.rfind("\n", 0, limit)
+            if split_at == -1:
+                split_at = text.rfind(" ", 0, limit)
+            if split_at == -1:
+                split_at = limit
+            
+            chunk = text[:split_at]
+            text = text[split_at:].lstrip()
+
+        try:
+            # message_obj can be a Message or the bot itself with chat_id
+            if hasattr(message_obj, "reply_text"):
+                await message_obj.reply_text(chunk, **kwargs)
+            else:
+                await message_obj.send_message(chat_id=MY_ID, text=chunk, **kwargs)
+        except Exception as e:
+            logger.error(f"Error sending message chunk: {e}")
+            try:
+                if hasattr(message_obj, "reply_text"):
+                    await message_obj.reply_text(chunk)
+                else:
+                    await message_obj.send_message(chat_id=MY_ID, text=chunk)
+            except: pass
+
+
 async def trigger_scheduled_task(prompt: str):
-    """
-    Called by the scheduler to run an agent task automatically.
-    """
+    """Called by the scheduler to run an agent task automatically."""
     if not GLOBAL_APPLICATION:
         return
 
     logger.info(f"Executing scheduled prompt: {prompt[:50]}...")
-    
-    # Send an initial notification
-    header = "📅 <b>Scheduled Task Triggered</b>"
-    msg = await GLOBAL_APPLICATION.bot.send_message(chat_id=MY_ID, text=header, parse_mode="HTML")
+    await GLOBAL_APPLICATION.bot.send_message(chat_id=MY_ID, text="📅 <b>Scheduled Task Triggered</b>", parse_mode="HTML")
     
     full_response = ""
-    
     async def callback(event_type, event_data):
         nonlocal full_response
         if event_type == "message" and event_data.get("role") == "assistant":
             full_response += event_data.get("content", "")
 
-    # We use a dummy chat_id for subprocess tracking (or use MY_ID)
     await call_gemini_stream(prompt, MY_ID, callback)
     
-    final_text = f"📅 <b>Scheduled Report</b>\n\n{_format_html_response(full_response)}"
-    await GLOBAL_APPLICATION.bot.send_message(chat_id=MY_ID, text=final_text[:4096], parse_mode="HTML")
+    final_text = _format_html_response(full_response)
+    if final_text:
+        await _send_long_message(GLOBAL_APPLICATION.bot, f"📅 <b>Scheduled Report</b>\n\n{final_text}", parse_mode="HTML")
 
 
 async def chat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -186,7 +239,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Main message handler."""
+    """Main message handler with live streaming updates."""
     if not update.message or is_not_user(update):
         return
 
@@ -205,14 +258,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async def callback(event_type, event_data):
             nonlocal full_response, status_msg, last_update_time
             if STOP_SIGNAL.get(chat_id): return
+            
             if event_type == "message" and event_data.get("role") == "assistant":
                 full_response += event_data.get("content", "")
                 now = asyncio.get_event_loop().time()
                 if now - last_update_time > 1.2:
                     clean = _format_html_response(full_response)
                     if clean:
+                        # Truncate live updates to avoid length errors
+                        display_text = clean
+                        if len(display_text) > 3500:
+                            display_text = "..." + display_text[-3500:]
                         try:
-                            await status_msg.edit_text(f"{clean} ▌", parse_mode="HTML")
+                            await status_msg.edit_text(f"{display_text} ▌", parse_mode="HTML")
                             last_update_time = now
                         except: pass
             elif event_type == "tool_use":
@@ -229,8 +287,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         final_text = _format_html_response(full_response)
         if final_text:
-            try: await status_msg.edit_text(final_text, parse_mode="HTML")
-            except: await update.message.reply_text(final_text, parse_mode="HTML")
+            try:
+                if len(final_text) < 4000:
+                    await status_msg.edit_text(final_text, parse_mode="HTML")
+                else:
+                    await status_msg.delete()
+                    await _send_long_message(update.message, final_text, parse_mode="HTML")
+            except Exception as e:
+                await _send_long_message(update.message, final_text, parse_mode="HTML")
         else:
             try: await status_msg.edit_text("✅ <i>Done</i>", parse_mode="HTML")
             except: pass
@@ -263,8 +327,7 @@ async def post_init(application):
     ]
     await application.bot.set_my_commands(commands)
     
-    # Start the scheduler task
-    if hasattr(application, "scheduler_func"):
+    if hasattr(application, "scheduler_func") and application.scheduler_func:
         asyncio.create_task(application.scheduler_func(trigger_scheduled_task))
 
 
