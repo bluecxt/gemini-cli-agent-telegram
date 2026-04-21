@@ -50,10 +50,10 @@ async def call_gemini_stream(prompt, chat_id, callback):
     session_id = get_current_session(chat_id) or "latest"
 
     """
-    Inject system instructions into the prompt for every turn
-    if it's a fresh session or resumption.
+    Inject system instructions and enforce strict formatting rules.
     """
-    full_prompt = f"{SYSTEM_INSTRUCTIONS}\n\nUSER REQUEST: {prompt}"
+    format_reminder = "\n\nIMPORTANT: You MUST put ALL your internal monologue and tool reasoning inside <thinking> tags. NEVER use [Thought: ...] or markdown headers for reasoning."
+    full_prompt = f"{SYSTEM_INSTRUCTIONS}{format_reminder}\n\nUSER REQUEST: {prompt}"
 
     args = [
         "gemini", "--prompt", "-",
