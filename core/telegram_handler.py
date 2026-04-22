@@ -26,14 +26,14 @@ from telegram.ext import (
 
 from .config import TOKEN, MY_ID, TMP_DIR, WORKSPACE_DIR
 from .memory import set_current_session
-from .engine import call_gemini_stream, ACTIVE_SUBPROCESSES, STOP_SIGNAL
+from .engine import call_gemini_stream, ACTIVE_SUBPROCESSES, STOP_SIGNAL, LIVE_BUFFERS, CURRENT_COMMANDS
 from .logger import logger
 
 CHAT_LOCKS = {}
 GLOBAL_APPLICATION = None
 ACTIVE_STATUS_MSGS = {}  # chat_id: Message object
-
-TASKS_FILE = os.path.join(WORKSPACE_DIR, "tasks.json")
+LAST_TOOL_USED = {}      # chat_id: str
+CURRENT_DISPLAY_TEXT = {} # chat_id: str (to preserve state)
 
 # Mapping for cleaner action reporting
 TOOL_MAPPING = {
@@ -60,58 +60,34 @@ def is_not_user(update: Update) -> bool:
 async def _handle_attachments(message: Message) -> str:
     """Downloads attachments and returns the updated user input string."""
     user_input = message.text or ""
-
     if not (message.photo or message.document):
         return user_input
-
     try:
-        file_obj = await (
-            message.photo[-1] if message.photo
-            else message.document
-        ).get_file()
-
-        file_path = os.path.join(
-            TMP_DIR,
-            file_obj.file_path.split('/')[-1]
-        )
+        file_obj = await (message.photo[-1] if message.photo else message.document).get_file()
+        file_path = os.path.join(TMP_DIR, file_obj.file_path.split('/')[-1])
         await file_obj.download_to_drive(file_path)
-
         caption = message.caption or "Analysis"
         user_input = f"{caption}\n[FILE: {file_path}]"
         logger.info(f"Telegram Attachment downloaded: {file_path}")
     except Exception as e:
         logger.error(f"Error receiving file: {e}")
-
     return user_input
 
 
 def _format_html_response(text: str) -> str:
     """Cleans AI tags and converts Markdown to HTML."""
-    if not text:
-        return ""
-
-    # Remove thinking tags
+    if not text: return ""
     clean_text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL)
     clean_text = re.sub(r"<thinking>.*$", "", clean_text, flags=re.DOTALL)
     clean_text = re.sub(r"\[Thought:.*?\]", "", clean_text, flags=re.DOTALL).strip()
-
-    if not clean_text:
-        return ""
-
-    # Escape HTML
+    if not clean_text: return ""
     clean_text = clean_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-    # Markdown -> HTML
-    clean_text = re.sub(r"```(?:[\w]+)?\n?(.*?)```", r"<code>\1</code>", clean_text, flags=re.DOTALL)
+    clean_text = re.sub(r"```(?:[\w]+)?\n?(.*?)```", r"<pre>\1</pre>", clean_text, flags=re.DOTALL)
     clean_text = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", clean_text)
     clean_text = re.sub(r"(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)", r"<i>\1</i>", clean_text)
     clean_text = re.sub(r"`(.*?)`", r"<code>\1</code>", clean_text)
-
-    # Restore tags
     replacements = {"&lt;b&gt;": "<b>", "&lt;/b&gt;": "</b>", "&lt;i&gt;": "<i>", "&lt;/i&gt;": "</i>", "&lt;code&gt;": "<code>", "&lt;/code&gt;": "</code>", "&lt;pre&gt;": "<pre>", "&lt;/pre&gt;": "</pre>"}
-    for old, new in replacements.items():
-        clean_text = clean_text.replace(old, new)
-
+    for old, new in replacements.items(): clean_text = clean_text.replace(old, new)
     return clean_text
 
 
@@ -174,15 +150,18 @@ def _summarize_actions(actions):
     return "\n".join([f"🛠️ <i>{line}</i>" for line in summary_lines])
 
 
-async def _refresh_thinking_msg(chat_id, last_text="🤔 <b>Thinking...</b>"):
-    """Moves status message to bottom."""
+async def _refresh_thinking_msg(chat_id):
+    """Deletes the current thinking message and sends a new one at the bottom."""
+    text = CURRENT_DISPLAY_TEXT.get(chat_id, "🤔 <b>Thinking...</b>")
     if chat_id in ACTIVE_STATUS_MSGS:
         try: await ACTIVE_STATUS_MSGS[chat_id].delete()
         except: pass
     if GLOBAL_APPLICATION:
-        new_msg = await GLOBAL_APPLICATION.bot.send_message(chat_id=chat_id, text=last_text, parse_mode="HTML")
-        ACTIVE_STATUS_MSGS[chat_id] = new_msg
-        return new_msg
+        try:
+            new_msg = await GLOBAL_APPLICATION.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+            ACTIVE_STATUS_MSGS[chat_id] = new_msg
+            return new_msg
+        except: pass
     return None
 
 
@@ -191,6 +170,8 @@ async def trigger_scheduled_task(prompt: str):
     if not GLOBAL_APPLICATION: return
     logger.info(f"Scheduled task: {prompt[:50]}")
     status_msg = await GLOBAL_APPLICATION.bot.send_message(chat_id=MY_ID, text="🤔 <b>Thinking...</b>", parse_mode="HTML")
+    ACTIVE_STATUS_MSGS[MY_ID] = status_msg
+    CURRENT_DISPLAY_TEXT[MY_ID] = "🤔 <b>Thinking...</b>"
     full_response, actions_taken = "", []
     async def callback(e_type, e_data):
         nonlocal full_response
@@ -198,16 +179,48 @@ async def trigger_scheduled_task(prompt: str):
             full_response += e_data.get("content", "")
         elif e_type == "tool_use":
             name = e_data.get("tool_name") or e_data.get("name") or "tool"
+            LAST_TOOL_USED[MY_ID] = name
             params = e_data.get("parameters", {})
             p_val = params.get("file_path") or params.get("dir_path") or params.get("command") or ""
             actions_taken.append((TOOL_MAPPING.get(name, name), str(p_val)[:20], True))
+            if name == "run_shell_command": CURRENT_COMMANDS[MY_ID] = str(p_val)
     await call_gemini_stream(prompt, MY_ID, callback)
     try: await status_msg.delete()
     except: pass
+    ACTIVE_STATUS_MSGS.pop(MY_ID, None)
+    LAST_TOOL_USED.pop(MY_ID, None)
+    CURRENT_DISPLAY_TEXT.pop(MY_ID, None)
+    await _process_and_send_final(None, full_response, actions_taken, is_scheduled=True)
+
+
+async def _process_and_send_final(update_msg, full_response, actions_taken, is_scheduled=False):
+    """Interleaves text/images in correct order."""
     final_text = _format_html_response(full_response)
-    report = _summarize_actions(actions_taken)
-    if final_text or report:
-        await _send_long_message(GLOBAL_APPLICATION.bot, f"📅 <b>Report</b>\n\n{report}\n\n{final_text}", parse_mode="HTML")
+    action_report = _summarize_actions(actions_taken)
+    parts = re.split(r"(\[SEND_IMAGE:.*?\])", final_text)
+    first_block = True
+    for part in parts:
+        part = part.strip()
+        if not part: continue
+        if part.startswith("[SEND_IMAGE:"):
+            img_path = part.replace("[SEND_IMAGE:", "").replace("]", "").strip()
+            if os.path.exists(img_path):
+                try:
+                    photo = open(img_path, 'rb')
+                    if is_scheduled: await GLOBAL_APPLICATION.bot.send_photo(chat_id=MY_ID, photo=photo, caption=f"🖼️ {os.path.basename(img_path)}")
+                    else: await update_msg.reply_photo(photo=photo, caption=f"🖼️ {os.path.basename(img_path)}")
+                except Exception as e: logger.error(f"Error sending image: {e}")
+            else: logger.warning(f"Image path not found: {img_path}")
+        else:
+            msg_to_send = part
+            if first_block and action_report:
+                msg_to_send = f"{action_report}\n\n{part}"
+                first_block = False
+            if is_scheduled: await _send_long_message(GLOBAL_APPLICATION.bot, msg_to_send, parse_mode="HTML")
+            else: await _send_long_message(update_msg, msg_to_send, parse_mode="HTML")
+    if first_block and action_report:
+        if is_scheduled: await GLOBAL_APPLICATION.bot.send_message(chat_id=MY_ID, text=action_report, parse_mode="HTML")
+        else: await update_msg.reply_text(action_report, parse_mode="HTML")
 
 
 async def chat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -244,53 +257,44 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_not_user(update): return
     chat_id = update.effective_chat.id
     procs = ACTIVE_SUBPROCESSES.get(chat_id, [])
-    status = f"⚙️ <b>Status:</b> {len(procs)} active." if procs else "💤 <b>Status:</b> Idle."
+    if not procs:
+        await update.message.reply_text("💤 <b>Status:</b> Idle.", parse_mode="HTML")
+        return
+    last_tool = LAST_TOOL_USED.get(chat_id, "Thinking")
+    status = f"⚙️ <b>Status:</b> {len(procs)} active.\n🎯 <b>Activity:</b> <code>{last_tool}</code>"
+    if chat_id in CURRENT_COMMANDS: status += f"\n💻 <b>Command:</b> <code>{CURRENT_COMMANDS[chat_id]}</code>"
+    if chat_id in LIVE_BUFFERS and LIVE_BUFFERS[chat_id]:
+        logs = "\n".join(LIVE_BUFFERS[chat_id]).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        status += f"\n\n📝 <b>Live Logs:</b>\n<pre>{logs}</pre>"
     await update.message.reply_text(status, parse_mode="HTML")
     if chat_id in ACTIVE_STATUS_MSGS: await _refresh_thinking_msg(chat_id)
 
 
 async def tasks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Interactive task management."""
     if is_not_user(update): return
+    if not os.path.exists(TASKS_FILE): await update.message.reply_text("ℹ️ No tasks."); return
     import json
-    if not os.path.exists(TASKS_FILE):
-        await update.message.reply_text("ℹ️ No tasks scheduled.")
-        return
     with open(TASKS_FILE, 'r') as f: tasks = json.load(f)
-    if not tasks:
-        await update.message.reply_text("ℹ️ Task list is empty.")
-        return
-    
-    text = "📋 <b>Scheduled Tasks:</b>\n\n"
-    keyboard = []
-    for i, t in enumerate(tasks):
-        text += f"{i+1}. <b>{t['name']}</b> at {t['time']}\n"
-        keyboard.append([InlineKeyboardButton(f"❌ Delete {t['name']}", callback_data=f"del_task_{i}")])
-    
+    if not tasks: await update.message.reply_text("ℹ️ Empty."); return
+    text = "📋 <b>Tasks:</b>\n\n"
+    keyboard = [[InlineKeyboardButton(f"❌ {t['name']}", callback_data=f"del_task_{i}")] for i, t in enumerate(tasks)]
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def update_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Self-update gemini-cli."""
     if is_not_user(update): return
-    msg = await update.message.reply_text("🔄 <b>Updating Gemini CLI...</b>", parse_mode="HTML")
+    msg = await update.message.reply_text("🔄 <b>Updating...</b>", parse_mode="HTML")
     try:
-        proc = await asyncio.create_subprocess_shell(
-            "npm install -g @google/gemini-cli@nightly",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await proc.communicate()
+        proc = await asyncio.create_subprocess_shell("npm install -g @google/gemini-cli@nightly", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        await proc.communicate()
         if proc.returncode == 0:
-            await msg.edit_text("✅ <b>Gemini CLI updated!</b>\nRestarting bot process...", parse_mode="HTML")
+            await msg.edit_text("✅ <b>Updated!</b> Restarting...", parse_mode="HTML")
             os.execv(sys.executable, ['python'] + sys.argv)
-        else:
-            await msg.edit_text(f"❌ <b>Update failed:</b>\n<code>{stderr.decode()}</code>", parse_mode="HTML")
-    except Exception as e:
-        await msg.edit_text(f"❌ <b>Error:</b> {e}", parse_mode="HTML")
+        else: await msg.edit_text("❌ Failed.", parse_mode="HTML")
+    except Exception as e: await msg.edit_text(f"❌ Error: {e}", parse_mode="HTML")
 
 
 async def task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles task deletion buttons."""
     query = update.callback_query
     await query.answer()
     if query.data.startswith("del_task_"):
@@ -300,7 +304,7 @@ async def task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if 0 <= idx < len(tasks):
             removed = tasks.pop(idx)
             with open(TASKS_FILE, 'w') as f: json.dump(tasks, f, indent=4)
-            await query.edit_message_text(f"✅ Task <b>{removed['name']}</b> deleted.", parse_mode="HTML")
+            await query.edit_message_text(f"✅ Deleted: <b>{removed['name']}</b>", parse_mode="HTML")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -312,6 +316,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         STOP_SIGNAL[chat_id] = False
         status_msg = await update.message.reply_text("🤔 <b>Thinking...</b>", parse_mode="HTML")
         ACTIVE_STATUS_MSGS[chat_id] = status_msg
+        CURRENT_DISPLAY_TEXT[chat_id] = "🤔 <b>Thinking...</b>"
         full_response, actions_taken = "", []
         last_update_time, text_since_last_action = 0, False
 
@@ -327,17 +332,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if now - last_update_time > 1.2:
                     clean = _format_html_response(full_response)
                     if clean:
-                        disp = clean if len(clean) <= 3500 else "..." + clean[-3500:]
-                        try: await ACTIVE_STATUS_MSGS[chat_id].edit_text(f"{disp} ▌", parse_mode="HTML"); last_update_time = now
+                        disp = (clean if len(clean) <= 3500 else "..." + clean[-3500:]) + " ▌"
+                        CURRENT_DISPLAY_TEXT[chat_id] = disp
+                        try: await ACTIVE_STATUS_MSGS[chat_id].edit_text(disp, parse_mode="HTML"); last_update_time = now
                         except: pass
             elif e_type == "tool_use":
                 name = e_data.get("tool_name") or e_data.get("name") or "tool"
+                LAST_TOOL_USED[chat_id] = name
                 params = e_data.get("parameters", {})
                 p_val = params.get("file_path") or params.get("dir_path") or params.get("command") or params.get("pattern") or ""
                 p_disp = (str(p_val)[:25] + "...") if len(str(p_val)) > 25 else str(p_val)
                 actions_taken.append((TOOL_MAPPING.get(name, name), p_disp, text_since_last_action))
                 text_since_last_action = False
-                disp = f"⚙️ <b>Exec:</b> <code>{(p_val[:40] + '...') if len(str(p_val)) > 40 else p_val}</code>" if name == "run_shell_command" else f"⚙️ <i>Using: {name}...</i>"
+                if name == "run_shell_command":
+                    CURRENT_COMMANDS[chat_id] = str(p_val)
+                    disp = f"⚙️ <b>Exec:</b> <code>{(str(p_val)[:40] + '...') if len(str(p_val)) > 40 else p_val}</code>"
+                else: disp = f"⚙️ <i>Using: {name}...</i>"
+                CURRENT_DISPLAY_TEXT[chat_id] = disp
                 try: await ACTIVE_STATUS_MSGS[chat_id].edit_text(disp, parse_mode="HTML")
                 except: pass
 
@@ -346,12 +357,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try: await ACTIVE_STATUS_MSGS[chat_id].delete()
             except: pass
             ACTIVE_STATUS_MSGS.pop(chat_id)
-        
-        final_text = _format_html_response(full_response)
-        report = _summarize_actions(actions_taken)
-        full_msg = f"{report}\n\n{final_text}".strip()
-        if full_msg: await _send_long_message(update.message, full_msg, parse_mode="HTML")
-        elif exit_code != 0: await update.message.reply_text(f"❌ <b>Error:</b> {err[:500]}", parse_mode="HTML")
+        LAST_TOOL_USED.pop(chat_id, None)
+        CURRENT_COMMANDS.pop(chat_id, None)
+        CURRENT_DISPLAY_TEXT.pop(chat_id, None)
+        if STOP_SIGNAL.get(chat_id): await update.message.reply_text("🛑 <b>Stopped.</b>", parse_mode="HTML"); return
+        await _process_and_send_final(update.message, full_response, actions_taken)
+        if exit_code != 0 and not full_response: await update.message.reply_text(f"❌ <b>Error:</b> {err[:500]}", parse_mode="HTML")
 
 
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -364,20 +375,21 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: pass
     await update.message.reply_text("🛑 Stopped.", parse_mode="HTML")
     ACTIVE_STATUS_MSGS.pop(chat_id, None)
+    LAST_TOOL_USED.pop(chat_id, None)
+    CURRENT_COMMANDS.pop(chat_id, None)
+    CURRENT_DISPLAY_TEXT.pop(chat_id, None)
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Telegram Error: {context.error}")
 
 
 async def post_init(application):
     global GLOBAL_APPLICATION
     GLOBAL_APPLICATION = application
-    commands = [BotCommand("start", "Menu"), BotCommand("chat", "Sessions"), BotCommand("tasks", "Manage Tasks"), BotCommand("status", "Status"), BotCommand("update", "Update CLI"), BotCommand("stop", "Stop")]
+    commands = [BotCommand("start", "Menu"), BotCommand("chat", "Sessions"), BotCommand("tasks", "Tasks"), BotCommand("status", "Status"), BotCommand("update", "Update"), BotCommand("stop", "Stop")]
     await application.bot.set_my_commands(commands)
-    if hasattr(application, "scheduler_func") and application.scheduler_func:
-        asyncio.create_task(application.scheduler_func(trigger_scheduled_task))
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """Global error handler"""
-    logger.error(f"Telegram Error: {context.error}")
+    if hasattr(application, "scheduler_func") and application.scheduler_func: asyncio.create_task(application.scheduler_func(trigger_scheduled_task))
 
 
 def run_bot(scheduler_func=None):
