@@ -1,0 +1,2 @@
+- [ ] add clear error with the error code
+- [ ] add a way for the agent to call himself
