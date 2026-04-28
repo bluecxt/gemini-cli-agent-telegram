@@ -444,7 +444,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
                 # Prepare for the next message (silent)
                 status_msg = await update.message.reply_text("🤔 <b>Thinking...</b>", parse_mode="HTML", disable_notification=True)
-                last_update_time = 0        exit_code, error_msg = await call_gemini_stream(user_input, chat_id, callback)
+                last_update_time = 0
+        
+        exit_code, error_msg = await call_gemini_stream(user_input, chat_id, callback)
 
         if STOP_SIGNAL.get(chat_id):
             try: await status_msg.edit_text("🛑 <b>Stopped.</b>", parse_mode="HTML")
