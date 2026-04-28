@@ -88,6 +88,9 @@ async def call_gemini_stream(prompt, chat_id, callback):
         "--approval-mode", "yolo"
     ]
 
+    if session_id and session_id != "fresh_session":
+        args.extend(["--resume", session_id])
+
     env = os.environ.copy()
     env["GEMINI_CLI_TRUST_WORKSPACE"] = "true"
 
