@@ -85,18 +85,18 @@ async def call_gemini_stream(prompt, chat_id, callback):
     args = [
         "gemini", "--prompt", "-",
         "--output-format", "stream-json",
-        "--approval-mode", "yolo",
-        "--skip-trust"
+        "--approval-mode", "yolo"
     ]
 
-    if session_id and session_id != "fresh_session":
-        args.extend(["--resume", session_id])
+    env = os.environ.copy()
+    env["GEMINI_CLI_TRUST_WORKSPACE"] = "true"
 
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+        stderr=asyncio.subprocess.PIPE,
+        env=env
     )
     register_process(chat_id, proc)
 
