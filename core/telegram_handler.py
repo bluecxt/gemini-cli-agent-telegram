@@ -324,10 +324,15 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_id in ACTIVE_STATUS_MSGS: await _refresh_thinking_msg(chat_id)
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Main message handler with live streaming updates and progressive message delivery."""
-    if not update.message or is_not_user(update):
-        return
+async def tasks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_not_user(update): return
+    if not os.path.exists(TASKS_FILE): await update.message.reply_text("ℹ️ No tasks."); return
+    import json
+    with open(TASKS_FILE, 'r') as f: tasks = json.load(f)
+    if not tasks: await update.message.reply_text("ℹ️ Empty."); return
+    text = "📋 <b>Tasks:</b>\n\n"
+    keyboard = [[InlineKeyboardButton(f"❌ {t['name']}", callback_data=f"del_task_{i}")] for i, t in enumerate(tasks)]
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def update_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
