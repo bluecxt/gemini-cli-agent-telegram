@@ -83,7 +83,7 @@ async def call_gemini_stream(prompt, chat_id, callback):
     full_prompt = f"{SYSTEM_INSTRUCTIONS}{format_reminder}\n\nUSER REQUEST: {prompt}"
 
     args = [
-        "gemini", "--prompt", "-",
+        "gemini", "--model", "gemini-1.5-flash", "--prompt", "-",
         "--output-format", "stream-json",
         "--approval-mode", "yolo"
     ]
