@@ -311,15 +311,27 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_not_user(update): return
     chat_id = update.effective_chat.id
     procs = ACTIVE_SUBPROCESSES.get(chat_id, [])
+    
     if not procs:
-        await update.message.reply_text("💤 <b>Status:</b> Idle.", parse_mode="HTML")
+        await update.message.reply_text("😴 <b>Status:</b> Idle", parse_mode="HTML")
         return
+
     last_tool = LAST_TOOL_USED.get(chat_id, "Thinking")
-    status = f"⚙️ <b>Status:</b> {len(procs)} active.\n🎯 <b>Activity:</b> <code>{last_tool}</code>"
-    if chat_id in CURRENT_COMMANDS: status += f"\n💻 <b>Command:</b> <code>{CURRENT_COMMANDS[chat_id]}</code>"
+    
+    status = (
+        f"🚀 <b>Agent Status</b>\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"👥 <b>Active Processes:</b> {len(procs)}\n"
+        f"🎯 <b>Current Activity:</b> <code>{last_tool}</code>\n"
+    )
+    
+    if chat_id in CURRENT_COMMANDS:
+        status += f"💻 <b>Executing:</b> <code>{CURRENT_COMMANDS[chat_id]}</code>\n"
+    
     if chat_id in LIVE_BUFFERS and LIVE_BUFFERS[chat_id]:
         logs = "\n".join(LIVE_BUFFERS[chat_id]).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        status += f"\n\n📝 <b>Live Logs:</b>\n<pre>{logs}</pre>"
+        status += f"\n📝 <b>Live Logs:</b>\n<pre>{logs}</pre>"
+    
     await update.message.reply_text(status, parse_mode="HTML")
     if chat_id in ACTIVE_STATUS_MSGS: await _refresh_thinking_msg(chat_id)
 
@@ -423,16 +435,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await finalize_current_msg()
 
                 name = event_data.get("tool_name") or event_data.get("name") or "tool"
-                args = event_data.get("args", {})
-
+                params = event_data.get("parameters") or event_data.get("args") or {}
+                
                 display_name = name
-                if name == "run_shell_command" and "command" in args:
-                    cmd = args["command"]
+                if name == "run_shell_command" and "command" in params:
+                    cmd = params["command"]
                     if len(cmd) > 200:
                         cmd = cmd[:197] + "..."
                     display_name = f"<code>{cmd}</code>"
-
+                elif name == "read_file" and "file_path" in params:
+                    display_name = f"read <code>{params['file_path']}</code>"
+                
                 current_tool_name = display_name
+                LAST_TOOL_USED[chat_id] = name
+                if name == "run_shell_command" and "command" in params:
+                    CURRENT_COMMANDS[chat_id] = params["command"]
+
                 # Send a NEW message for the tool usage (silent)
                 status_msg = await update.message.reply_text(f"⚙️ <i>Using: {display_name}...</i>", parse_mode="HTML", disable_notification=True)
                 last_update_time = 0
@@ -442,6 +460,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     await status_msg.edit_text(f"✅ <i>Using: {current_tool_name}...</i>", parse_mode="HTML")
                 except: pass
+                
+                LAST_TOOL_USED[chat_id] = "Analyzing result"
                 # Prepare for the next message (silent)
                 status_msg = await update.message.reply_text("🤔 <b>Thinking...</b>", parse_mode="HTML", disable_notification=True)
                 last_update_time = 0
