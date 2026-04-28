@@ -97,8 +97,6 @@ def _format_html_response(text: str) -> str:
         # Show only the last active thought during stream
         processed_text = "<i>" + parts[-1].strip() + "</i>"
 
-    # STRATEGY: Strip everything that isn't inside <i> (thinking) or isn't our final formatted response.
-    # However, for simplicity and stability, we'll keep the full text and just ensure tags are balanced.
     clean_text = processed_text.strip()
 
     """ 2. Escape basic HTML to avoid parse errors (except our tags) """
@@ -195,12 +193,14 @@ def _summarize_actions(actions):
     if not actions: return ""
     summary_lines, current_group = [], []
     for name, param, has_text_before in actions:
+        # Wrap param in code tags
+        formatted_param = f"<code>{param}</code>" if param else ""
         if has_text_before or not current_group:
             if current_group: summary_lines.append(", ".join(current_group))
-            current_group = [f"{name} {param}"]
-        else: current_group.append(f"{name} {param}")
+            current_group = [f"{name} {formatted_param}"]
+        else: current_group.append(f"{name} {formatted_param}")
     if current_group: summary_lines.append(", ".join(current_group))
-    return "\n".join([f"🛠️ <i>{line}</i>" for line in summary_lines])
+    return "\n".join([f"🛠️ {line}" for line in summary_lines])
 
 
 async def _refresh_thinking_msg(chat_id):
@@ -480,22 +480,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 name = event_data.get("tool_name") or event_data.get("name") or "tool"
                 params = event_data.get("parameters") or event_data.get("args") or {}
                 
-                display_name = name
+                tool_nick = TOOL_MAPPING.get(name, name)
                 p_val = ""
+                
                 if name == "run_shell_command" and "command" in params:
-                    cmd = params["command"]
-                    p_val = cmd
-                    if len(cmd) > 200:
-                        cmd = cmd[:197] + "..."
-                    display_name = f"<code>{cmd}</code>"
+                    p_val = params["command"]
                 elif name == "read_file" and "file_path" in params:
                     p_val = params['file_path']
-                    display_name = f"read <code>{p_val}</code>"
+                elif "file_path" in params: p_val = params["file_path"]
                 elif "dir_path" in params: p_val = params["dir_path"]
                 elif "pattern" in params: p_val = params["pattern"]
                 
-                p_disp = (str(p_val)[:25] + "...") if len(str(p_val)) > 25 else str(p_val)
-                actions_taken.append((TOOL_MAPPING.get(name, name), p_disp, True))
+                # Truncate for the internal tracking
+                p_disp = (str(p_val)[:200] + "...") if len(str(p_val)) > 200 else str(p_val)
+                display_name = f"{tool_nick} <code>{p_disp}</code>" if p_disp else tool_nick
+                
+                # For the final summary, use a shorter version
+                p_short = (str(p_val)[:25] + "...") if len(str(p_val)) > 25 else str(p_val)
+                actions_taken.append((tool_nick, p_short, True))
                 full_response += f"\n[ACTION_INDEX:{len(actions_taken)-1}]\n"
 
                 current_tool_name = display_name
@@ -504,13 +506,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     CURRENT_COMMANDS[chat_id] = params["command"]
 
                 # Send a NEW message for the tool usage (silent)
-                status_msg = await update.message.reply_text(f"⚙️ Using: {display_name}", parse_mode="HTML", disable_notification=True)
+                status_msg = await update.message.reply_text(f"🛠️ {display_name}", parse_mode="HTML", disable_notification=True)
                 last_update_time = 0
 
             elif event_type == "tool_result":
                 # Update the tool message to show completion (silent)
                 try:
-                    await status_msg.edit_text(f"✅ Using: {current_tool_name}", parse_mode="HTML")
+                    await status_msg.edit_text(f"🛠️ {current_tool_name}", parse_mode="HTML")
                 except: pass
                 
                 LAST_TOOL_USED[chat_id] = "Analyzing result"
