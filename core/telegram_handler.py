@@ -493,12 +493,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 elif "dir_path" in params: p_val = params["dir_path"]
                 elif "pattern" in params: p_val = params["pattern"]
                 
-                # Truncate for the internal tracking
-                p_disp = (str(p_val)[:200] + "...") if len(str(p_val)) > 200 else str(p_val)
+                # Truncate for the internal tracking (live display)
+                p_disp = (str(p_val)[:500] + "...") if len(str(p_val)) > 500 else str(p_val)
                 display_name = f"{tool_nick} <code>{p_disp}</code>" if p_disp else tool_nick
                 
-                # For the final summary, use a shorter version
-                p_short = (str(p_val)[:25] + "...") if len(str(p_val)) > 25 else str(p_val)
+                # For the final summary, use a reasonably long version
+                p_short = (str(p_val)[:100] + "...") if len(str(p_val)) > 100 else str(p_val)
                 actions_taken.append((tool_nick, p_short, True))
                 full_response += f"\n[ACTION_INDEX:{len(actions_taken)-1}]\n"
 
