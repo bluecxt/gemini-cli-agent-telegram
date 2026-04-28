@@ -4,6 +4,7 @@ Gemini Engine - Core reasoning loop with real-time logs buffering.
 
 import json
 import asyncio
+import os
 from collections import deque
 from .memory import get_current_session, set_current_session
 from .logger import logger
