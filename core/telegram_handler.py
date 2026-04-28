@@ -452,13 +452,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     CURRENT_COMMANDS[chat_id] = params["command"]
 
                 # Send a NEW message for the tool usage (silent)
-                status_msg = await update.message.reply_text(f"⚙️ <i>Using: {display_name}...</i>", parse_mode="HTML", disable_notification=True)
+                status_msg = await update.message.reply_text(f"⚙️ <i>Using: {display_name}</i>", parse_mode="HTML", disable_notification=True)
                 last_update_time = 0
 
             elif event_type == "tool_result":
                 # Update the tool message to show completion (silent)
                 try:
-                    await status_msg.edit_text(f"✅ <i>Using: {current_tool_name}...</i>", parse_mode="HTML")
+                    await status_msg.edit_text(f"✅ <i>Using: {current_tool_name}</i>", parse_mode="HTML")
                 except: pass
                 
                 LAST_TOOL_USED[chat_id] = "Analyzing result"
