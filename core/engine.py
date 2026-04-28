@@ -5,6 +5,7 @@ Gemini Engine - Core reasoning loop with real-time logs buffering.
 import json
 import asyncio
 import os
+import re
 from collections import deque
 from .memory import get_current_session, set_current_session
 from .logger import logger
@@ -13,6 +14,7 @@ ACTIVE_SUBPROCESSES = {}
 STOP_SIGNAL = {}
 LIVE_BUFFERS = {}  # chat_id: deque of strings
 CURRENT_COMMANDS = {}  # chat_id: str
+ERR_STATES = {}    # chat_id: dict to store transient error info
 
 SYSTEM_INSTRUCTIONS = """
 You are the Gemini CLI Agent, a high-performance autonomous engineering assistant.
@@ -51,6 +53,9 @@ async def _read_stream(stream, chat_id, is_stderr=False):
     """ Reads a stream line by line and updates the live buffer. """
     if chat_id not in LIVE_BUFFERS:
         LIVE_BUFFERS[chat_id] = deque(maxlen=20)
+    
+    if chat_id not in ERR_STATES:
+        ERR_STATES[chat_id] = {"code": None, "msg": None}
         
     while True:
         line = await stream.readline()
@@ -59,11 +64,41 @@ async def _read_stream(stream, chat_id, is_stderr=False):
         
         text = line.decode().strip()
         if text:
-            # If it's stderr or non-JSON stdout, add to live buffer
-            if is_stderr or not (text.startswith("{") and text.endswith("}")):
-                LIVE_BUFFERS[chat_id].append(text)
-                if is_stderr:
+            if is_stderr:
+                # 1. Try to extract common error fields (status, code, message, statusText)
+                m_code = re.search(r"(?:code|status):\s*(\d+)", text)
+                m_msg = re.search(r"(?:message|statusText):\s*['\"]?([^'\",}]+)['\"]?", text)
+                
+                state = ERR_STATES[chat_id]
+                if m_code: state["code"] = m_code.group(1)
+                if m_msg: state["msg"] = m_msg.group(1)
+                
+                # 2. If we have a full pair, emit a clean error
+                if state["code"] and state["msg"]:
+                    formatted = f"❌ <b>Error {state['code']}:</b> {state['msg']}"
+                    if not any(formatted in l for l in LIVE_BUFFERS[chat_id]):
+                        LIVE_BUFFERS[chat_id].append(formatted)
+                    # We don't reset immediately to prevent duplicate noise matches in the same block
+                
+                # 3. Detect if the line is technical noise (Node.js/Gaxios dump)
+                # Matches patterns like "key: value," or "{", "}", "]," etc.
+                is_noise = re.search(r"^[ \t]*[a-zA-Z0-9_]+:.*?,?$", text) or \
+                           text.strip() in ["{", "}", "[", "]", "},", "],", "],"] or \
+                           (text.startswith("'") and (text.endswith("',") or text.endswith("'")))
+                
+                if is_noise:
+                    continue
+
+                # 4. If it's a meaningful one-liner (CLI logs), show it
+                if any(kw in text.lower() for kw in ["error", "exception", "warning", "failed", "no capacity"]):
+                    # Reset state for the next potential error burst
+                    ERR_STATES[chat_id] = {"code": None, "msg": None}
+                    LIVE_BUFFERS[chat_id].append(f"⚠️ {text}")
                     logger.warning(f"Gemini Stderr [{chat_id}]: {text}")
+            else:
+                # If it's non-JSON stdout, add to live buffer
+                if not (text.startswith("{") and text.endswith("}")):
+                    LIVE_BUFFERS[chat_id].append(text)
 
 
 async def call_gemini_stream(prompt, chat_id, callback):
