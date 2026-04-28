@@ -28,18 +28,21 @@ async def scheduler_loop(bot_callback):
                 now = datetime.now()
                 current_time = now.strftime("%H:%M")
                 today = now.strftime("%Y-%m-%d")
+                day_name = now.strftime("%A") # e.g. "Monday"
                 
                 updated = False
                 remaining_tasks = []
 
                 for task in tasks:
-                    # Check if it's time to run
-                    should_run = (
-                        task.get("time") == current_time and 
-                        task.get("last_run") != today
-                    )
+                    # Check if it's time to run and it hasn't run today yet
+                    time_match = task.get("time") == current_time
+                    not_run_today = task.get("last_run") != today
+                    
+                    # Check day if "days" list is present
+                    days = task.get("days", [])
+                    day_match = not days or (day_name in days)
 
-                    if should_run:
+                    if time_match and not_run_today and day_match:
                         logger.info(f"Triggering task: {task.get('name', 'unnamed')}")
                         
                         # Trigger the agent
