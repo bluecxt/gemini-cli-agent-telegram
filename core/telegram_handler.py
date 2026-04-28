@@ -24,7 +24,7 @@ from telegram.ext import (
     ContextTypes
 )
 
-from .config import TOKEN, MY_ID, TMP_DIR, WORKSPACE_DIR
+from .config import TOKEN, MY_ID, TMP_DIR, WORKSPACE_DIR, TASKS_FILE
 from .memory import set_current_session
 from .engine import call_gemini_stream, ACTIVE_SUBPROCESSES, STOP_SIGNAL, LIVE_BUFFERS, CURRENT_COMMANDS
 from .logger import logger
@@ -181,8 +181,10 @@ async def trigger_scheduled_task(prompt: str):
             name = e_data.get("tool_name") or e_data.get("name") or "tool"
             LAST_TOOL_USED[MY_ID] = name
             params = e_data.get("parameters", {})
-            p_val = params.get("file_path") or params.get("dir_path") or params.get("command") or ""
-            actions_taken.append((TOOL_MAPPING.get(name, name), str(p_val)[:20], True))
+            p_val = params.get("file_path") or params.get("dir_path") or params.get("command") or params.get("pattern") or ""
+            p_disp = (str(p_val)[:25] + "...") if len(str(p_val)) > 25 else str(p_val)
+            actions_taken.append((TOOL_MAPPING.get(name, name), p_disp, True))
+            full_response += f"\n[ACTION_INDEX:{len(actions_taken)-1}]\n"
             if name == "run_shell_command": CURRENT_COMMANDS[MY_ID] = str(p_val)
     await call_gemini_stream(prompt, MY_ID, callback)
     try: await status_msg.delete()
@@ -194,15 +196,39 @@ async def trigger_scheduled_task(prompt: str):
 
 
 async def _process_and_send_final(update_msg, full_response, actions_taken, is_scheduled=False):
-    """Interleaves text/images in correct order."""
+    """Interleaves text, images and tool actions in correct order."""
     final_text = _format_html_response(full_response)
-    action_report = _summarize_actions(actions_taken)
-    parts = re.split(r"(\[SEND_IMAGE:.*?\])", final_text)
-    first_block = True
+    # Split by images and action markers
+    pattern = r"(\[SEND_IMAGE:.*?\]|\[ACTION_INDEX:\d+\])"
+    parts = re.split(pattern, final_text)
+    
+    pending_actions = []
+    current_text_block = []
+
+    async def flush_text():
+        nonlocal current_text_block
+        text = "".join(current_text_block).strip()
+        if text:
+            if is_scheduled: await _send_long_message(GLOBAL_APPLICATION.bot, text, parse_mode="HTML")
+            else: await _send_long_message(update_msg, text, parse_mode="HTML")
+        current_text_block = []
+
+    async def flush_actions():
+        nonlocal pending_actions
+        if pending_actions:
+            actions = [actions_taken[i] for i in pending_actions if i < len(actions_taken)]
+            report = _summarize_actions(actions)
+            if report:
+                if is_scheduled: await GLOBAL_APPLICATION.bot.send_message(chat_id=MY_ID, text=report, parse_mode="HTML")
+                else: await update_msg.reply_text(report, parse_mode="HTML")
+            pending_actions = []
+
     for part in parts:
-        part = part.strip()
-        if not part: continue
+        if not part or not part.strip(): continue
+        
         if part.startswith("[SEND_IMAGE:"):
+            await flush_actions()
+            await flush_text()
             img_path = part.replace("[SEND_IMAGE:", "").replace("]", "").strip()
             if os.path.exists(img_path):
                 try:
@@ -211,16 +237,18 @@ async def _process_and_send_final(update_msg, full_response, actions_taken, is_s
                     else: await update_msg.reply_photo(photo=photo, caption=f"🖼️ {os.path.basename(img_path)}")
                 except Exception as e: logger.error(f"Error sending image: {e}")
             else: logger.warning(f"Image path not found: {img_path}")
+        elif part.startswith("[ACTION_INDEX:"):
+            await flush_text()
+            try:
+                idx = int(re.search(r"\d+", part).group())
+                pending_actions.append(idx)
+            except: pass
         else:
-            msg_to_send = part
-            if first_block and action_report:
-                msg_to_send = f"{action_report}\n\n{part}"
-                first_block = False
-            if is_scheduled: await _send_long_message(GLOBAL_APPLICATION.bot, msg_to_send, parse_mode="HTML")
-            else: await _send_long_message(update_msg, msg_to_send, parse_mode="HTML")
-    if first_block and action_report:
-        if is_scheduled: await GLOBAL_APPLICATION.bot.send_message(chat_id=MY_ID, text=action_report, parse_mode="HTML")
-        else: await update_msg.reply_text(action_report, parse_mode="HTML")
+            await flush_actions()
+            current_text_block.append(part)
+            
+    await flush_actions()
+    await flush_text()
 
 
 async def chat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -332,6 +360,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if now - last_update_time > 1.2:
                     clean = _format_html_response(full_response)
                     if clean:
+                        clean = re.sub(r"\[ACTION_INDEX:\d+\]", "", clean)
                         disp = (clean if len(clean) <= 3500 else "..." + clean[-3500:]) + " ▌"
                         CURRENT_DISPLAY_TEXT[chat_id] = disp
                         try: await ACTIVE_STATUS_MSGS[chat_id].edit_text(disp, parse_mode="HTML"); last_update_time = now
@@ -343,6 +372,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 p_val = params.get("file_path") or params.get("dir_path") or params.get("command") or params.get("pattern") or ""
                 p_disp = (str(p_val)[:25] + "...") if len(str(p_val)) > 25 else str(p_val)
                 actions_taken.append((TOOL_MAPPING.get(name, name), p_disp, text_since_last_action))
+                full_response += f"\n[ACTION_INDEX:{len(actions_taken)-1}]\n"
                 text_since_last_action = False
                 if name == "run_shell_command":
                     CURRENT_COMMANDS[chat_id] = str(p_val)

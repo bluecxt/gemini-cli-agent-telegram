@@ -22,6 +22,7 @@ WORKSPACE_DIR = os.path.join(ROOT_DIR, "workspace")
 TMP_DIR = os.path.join(ROOT_DIR, "tmp")
 REPOS_DIR = os.path.join(ROOT_DIR, "repos")
 SKILLS_DIR = os.path.join(ROOT_DIR, "skills")
+TASKS_FILE = os.path.join(WORKSPACE_DIR, "tasks.json")
 
 """ Ensure directories exist """
 for path in [WORKSPACE_DIR, TMP_DIR, REPOS_DIR, SKILLS_DIR]:
