@@ -375,13 +375,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # current_buffer holds the text for the current status_msg
         current_buffer = ""
         last_update_time = 0
-        
+        current_tool_name = "tool"
+
         async def finalize_current_msg(is_final=False):
             """Edits the current status_msg one last time and resets the buffer."""
             nonlocal status_msg, current_buffer
             if not current_buffer:
                 return
-            
+
             clean = _format_html_response(current_buffer)
             if clean:
                 try:
@@ -392,13 +393,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             current_buffer = ""
 
         async def callback(event_type, event_data):
-            nonlocal current_buffer, status_msg, last_update_time
+            nonlocal current_buffer, status_msg, last_update_time, current_tool_name
             if STOP_SIGNAL.get(chat_id): return
-            
+
             if event_type == "message" and event_data.get("role") == "assistant":
                 new_content = event_data.get("content", "")
                 current_buffer += new_content
-                
+
                 now = asyncio.get_event_loop().time()
                 # Periodic live update
                 if now - last_update_time > 1.0:
@@ -416,27 +417,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             await status_msg.edit_text(f"{display_text} ▌", parse_mode="HTML")
                             last_update_time = now
                         except: pass
-            
+
             elif event_type == "tool_use":
                 # Finalize any text before the tool
                 await finalize_current_msg()
 
                 name = event_data.get("tool_name") or event_data.get("name") or "tool"
+                args = event_data.get("args", {})
+
+                display_name = name
+                if name == "run_shell_command" and "command" in args:
+                    cmd = args["command"]
+                    if len(cmd) > 200:
+                        cmd = cmd[:197] + "..."
+                    display_name = f"<code>{cmd}</code>"
+
+                current_tool_name = display_name
                 # Send a NEW message for the tool usage (silent)
-                status_msg = await update.message.reply_text(f"⚙️ <i>Using: {name}...</i>", parse_mode="HTML", disable_notification=True)
-                status_msg.tool_name = name
+                status_msg = await update.message.reply_text(f"⚙️ <i>Using: {display_name}...</i>", parse_mode="HTML", disable_notification=True)
                 last_update_time = 0
 
             elif event_type == "tool_result":
                 # Update the tool message to show completion (silent)
-                name = getattr(status_msg, "tool_name", "tool")
                 try:
-                    await status_msg.edit_text(f"✅ <i>Using: {name}...</i>", parse_mode="HTML")
+                    await status_msg.edit_text(f"✅ <i>Using: {current_tool_name}...</i>", parse_mode="HTML")
                 except: pass
                 # Prepare for the next message (silent)
                 status_msg = await update.message.reply_text("🤔 <b>Thinking...</b>", parse_mode="HTML", disable_notification=True)
-                last_update_time = 0
-        exit_code, error_msg = await call_gemini_stream(user_input, chat_id, callback)
+                last_update_time = 0        exit_code, error_msg = await call_gemini_stream(user_input, chat_id, callback)
 
         if STOP_SIGNAL.get(chat_id):
             try: await status_msg.edit_text("🛑 <b>Stopped.</b>", parse_mode="HTML")
