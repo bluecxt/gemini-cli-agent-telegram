@@ -424,12 +424,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Initial thinking message is silent
         status_msg = await update.message.reply_text("🤔 <b>Thinking...</b>", parse_mode="HTML", disable_notification=True)
         
-        # current_buffer holds the text for the current status_msg
+        # State for tool results
         current_buffer = ""
         full_response = ""
         actions_taken = []
         last_update_time = 0
         current_tool_name = "tool"
+        current_tool_raw_name = ""
 
         async def finalize_current_msg(is_final=False):
             """Edits the current status_msg one last time and resets the buffer."""
@@ -447,7 +448,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             current_buffer = ""
 
         async def callback(event_type, event_data):
-            nonlocal current_buffer, full_response, actions_taken, status_msg, last_update_time, current_tool_name
+            nonlocal current_buffer, full_response, actions_taken, status_msg, last_update_time, current_tool_name, current_tool_raw_name
             if STOP_SIGNAL.get(chat_id): return
 
             if event_type == "message" and event_data.get("role") == "assistant":
@@ -478,6 +479,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await finalize_current_msg()
 
                 name = event_data.get("tool_name") or event_data.get("name") or "tool"
+                current_tool_raw_name = name
                 params = event_data.get("parameters") or event_data.get("args") or {}
                 
                 tool_nick = TOOL_MAPPING.get(name, name)
@@ -514,6 +516,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     await status_msg.edit_text(f"🛠️ {current_tool_name}", parse_mode="HTML")
                 except: pass
+
+                # If it's a Bash command, send the last 5 lines of output (silent)
+                if current_tool_raw_name == "run_shell_command":
+                    output = event_data.get("output", "")
+                    if output:
+                        lines = output.strip().split("\n")
+                        last_lines = "\n".join(lines[-5:])
+                        if last_lines:
+                            # Escape for HTML
+                            safe_output = last_lines.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                            await update.message.reply_text(f"<pre>{safe_output}</pre>", parse_mode="HTML", disable_notification=True)
                 
                 LAST_TOOL_USED[chat_id] = "Analyzing result"
                 # Prepare for the next message (silent)

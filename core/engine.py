@@ -28,7 +28,7 @@ MANDATORY REASONING FORMAT:
 
 MANDATORY FORMATTING:
 - Use <b>bold</b>, <i>italic</i>, <code>inline code</code> and <pre>blocks of code</pre> for Telegram.
-- USE A MAXIMUM OF EMOJIS in your final response to be as clear and visual as possible 🚀.
+- Use emojis moderately to make the response clear and professional.
 - NEVER use Markdown headers (#). Use <b>bold text</b> for section titles.
 - Final response to the user must be in French (Français). Internal analysis remains in English.
 """
