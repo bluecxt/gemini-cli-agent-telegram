@@ -420,21 +420,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif event_type == "tool_use":
                 # Finalize any text before the tool
                 await finalize_current_msg()
-                
+
                 name = event_data.get("tool_name") or event_data.get("name") or "tool"
                 # Send a NEW message for the tool usage (silent)
                 status_msg = await update.message.reply_text(f"⚙️ <i>Using: {name}...</i>", parse_mode="HTML", disable_notification=True)
-                last_update_time = 0
-                
-            elif event_type == "tool_result":
-                # Update the tool message to show completion (silent)
-                try:
-                    await status_msg.edit_text("✅ <i>Tool execution completed.</i>", parse_mode="HTML")
-                except: pass
-                # Prepare for the next message (silent)
-                status_msg = await update.message.reply_text("🤔 <b>Analyzing result...</b>", parse_mode="HTML", disable_notification=True)
+                status_msg.tool_name = name
                 last_update_time = 0
 
+            elif event_type == "tool_result":
+                # Update the tool message to show completion (silent)
+                name = getattr(status_msg, "tool_name", "tool")
+                try:
+                    await status_msg.edit_text(f"✅ <i>Using: {name}...</i>", parse_mode="HTML")
+                except: pass
+                # Prepare for the next message (silent)
+                status_msg = await update.message.reply_text("🤔 <b>Thinking...</b>", parse_mode="HTML", disable_notification=True)
+                last_update_time = 0
         exit_code, error_msg = await call_gemini_stream(user_input, chat_id, callback)
 
         if STOP_SIGNAL.get(chat_id):
