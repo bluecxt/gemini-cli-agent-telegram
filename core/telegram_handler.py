@@ -83,7 +83,10 @@ def _format_html_response(text: str) -> str:
         content = match.group(1).strip()
         # Keep it ultra-compact
         lines = [line.strip() for line in content.split("\n") if line.strip()]
-        return f"<i>{'\n'.join(lines)}</i>" if lines else ""
+        if not lines:
+            return ""
+        content_joined = "\n".join(lines)
+        return f"<i>{content_joined}</i>"
 
     # Convert closed thinking tags to italics
     processed_text = re.sub(r"<thinking>(.*?)</thinking>", format_thinking, text, flags=re.DOTALL)
