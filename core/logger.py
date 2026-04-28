@@ -11,6 +11,11 @@ import os
 os.makedirs("logs", exist_ok=True)
 
 
+class YoloFilter(logging.Filter):
+    def filter(self, record):
+        # Filter out the YOLO mode warning message
+        return "YOLO mode is enabled" not in record.getMessage()
+
 def setup_logger():
     """Configures a structured logger with console and file output."""
     logger = logging.getLogger("GeminiAgent")
@@ -24,6 +29,7 @@ def setup_logger():
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
     console_handler.setLevel(logging.INFO)
+    console_handler.addFilter(YoloFilter())
 
     """ File Handler (Rotates at 5MB, keeps 5 backups) """
     file_handler = RotatingFileHandler(
@@ -31,6 +37,7 @@ def setup_logger():
     )
     file_handler.setFormatter(formatter)
     file_handler.setLevel(logging.DEBUG)
+    file_handler.addFilter(YoloFilter())
 
     logger.addHandler(console_handler)
     logger.addHandler(file_handler)

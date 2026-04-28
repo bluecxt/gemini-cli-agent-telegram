@@ -74,38 +74,40 @@ def _format_html_response(text: str) -> str:
     if not text:
         return ""
 
-    """ 1. Robust thinking removal """
-    # Remove <thinking>...</thinking>
+    """ 1. Robust thinking formatting """
+    # Convert <thinking>...</thinking> to <i>...</i>
     clean_text = re.sub(
-        r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL
+        r"<thinking>(.*?)</thinking>", r"<i>\1</i>", text, flags=re.DOTALL
     )
-    # Remove any unclosed <thinking>
-    clean_text = re.sub(
-        r"<thinking>.*$", "", clean_text, flags=re.DOTALL
-    )
-    # Remove [Thought: ...] blocks and the reasoning immediately following it
+    # Handle unclosed <thinking> for live streaming
+    if "<thinking>" in clean_text and "</i>" not in clean_text[clean_text.find("<thinking>"):]:
+        clean_text = clean_text.replace("<thinking>", "<i>") + "</i>"
+    
+    # Remove [Thought: ...] blocks but keep the content if it's not in tags
     clean_text = re.sub(
         r"\[Thought:.*?\]", "", clean_text, flags=re.DOTALL
     )
-    
-    # Remove common reasoning headers at the start of paragraphs
-    headers_to_strip = [
-        "Considering", "Analyzing", "Summarizing", "Thinking", 
-        "Refining", "Investigating", "Checking", "Evaluating",
-        "Determining", "Scrutinizing", "Updating", "Developing"
-    ]
-    for header in headers_to_strip:
-        clean_text = re.sub(rf"^\s*{header}.*?\n", "", clean_text, flags=re.MULTILINE)
-        clean_text = re.sub(rf"^\s*\*\*{header}.*?\*\*.*?\n", "", clean_text, flags=re.MULTILINE)
 
     clean_text = clean_text.strip()
     if not clean_text:
         return ""
 
-    """ 2. Escape basic HTML to avoid parse errors """
+    """ 2. Escape basic HTML to avoid parse errors (except our tags) """
+    # We protect our intended tags first
+    clean_text = clean_text.replace("<b>", "[[B]]").replace("</b>", "[[/B]]")
+    clean_text = clean_text.replace("<i>", "[[I]]").replace("</i>", "[[/I]]")
+    clean_text = clean_text.replace("<code>", "[[C]]").replace("</code>", "[[/C]]")
+    clean_text = clean_text.replace("<pre>", "[[P]]").replace("</pre>", "[[/P]]")
+
     clean_text = clean_text.replace("&", "&amp;")
     clean_text = clean_text.replace("<", "&lt;")
     clean_text = clean_text.replace(">", "&gt;")
+
+    # Restore our tags
+    clean_text = clean_text.replace("[[B]]", "<b>").replace("[[/B]]", "</b>")
+    clean_text = clean_text.replace("[[I]]", "<i>").replace("[[/I]]", "</i>")
+    clean_text = clean_text.replace("[[C]]", "<code>").replace("[[/C]]", "</code>")
+    clean_text = clean_text.replace("[[P]]", "<pre>").replace("[[/P]]", "</pre>")
 
     """ 3. Convert Markdown to HTML """
     # Code blocks: ```text``` -> <code>text</code>
@@ -116,16 +118,6 @@ def _format_html_response(text: str) -> str:
     clean_text = re.sub(r"(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)", r"<i>\1</i>", clean_text)
     # Inline Code: `text` -> <code>text</code>
     clean_text = re.sub(r"`(.*?)`", r"<code>\1</code>", clean_text)
-
-    """ 4. Restore tags """
-    replacements = {
-        "&lt;b&gt;": "<b>", "&lt;/b&gt;": "</b>",
-        "&lt;i&gt;": "<i>", "&lt;/i&gt;": "</i>",
-        "&lt;code&gt;": "<code>", "&lt;/code&gt;": "</code>",
-        "&lt;pre&gt;": "<pre>", "&lt;/pre&gt;": "</pre>"
-    }
-    for old, new in replacements.items():
-        clean_text = clean_text.replace(old, new)
 
     return clean_text
 
@@ -239,7 +231,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Main message handler with live streaming updates."""
+    """Main message handler with live streaming updates and progressive message delivery."""
     if not update.message or is_not_user(update):
         return
 
@@ -251,32 +243,71 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_input = await _handle_attachments(update.message)
         STOP_SIGNAL[chat_id] = False
 
-        status_msg = await update.message.reply_text("🤔 <b>Thinking...</b>", parse_mode="HTML")
-        full_response = ""
+        # Initial thinking message is silent
+        status_msg = await update.message.reply_text("🤔 <b>Thinking...</b>", parse_mode="HTML", disable_notification=True)
+        
+        # current_buffer holds the text for the current status_msg
+        current_buffer = ""
         last_update_time = 0
+        
+        async def finalize_current_msg(is_final=False):
+            """Edits the current status_msg one last time and resets the buffer."""
+            nonlocal status_msg, current_buffer
+            if not current_buffer:
+                return
+            
+            clean = _format_html_response(current_buffer)
+            if clean:
+                try:
+                    # Editing a message never triggers a notification anyway
+                    await status_msg.edit_text(clean, parse_mode="HTML")
+                except:
+                    pass
+            current_buffer = ""
 
         async def callback(event_type, event_data):
-            nonlocal full_response, status_msg, last_update_time
+            nonlocal current_buffer, status_msg, last_update_time
             if STOP_SIGNAL.get(chat_id): return
             
             if event_type == "message" and event_data.get("role") == "assistant":
-                full_response += event_data.get("content", "")
+                new_content = event_data.get("content", "")
+                current_buffer += new_content
+                
                 now = asyncio.get_event_loop().time()
-                if now - last_update_time > 1.2:
-                    clean = _format_html_response(full_response)
+                # Periodic live update
+                if now - last_update_time > 1.0:
+                    clean = _format_html_response(current_buffer)
                     if clean:
-                        # Truncate live updates to avoid length errors
+                        # Truncate for live display if getting very long
                         display_text = clean
                         if len(display_text) > 3500:
-                            display_text = "..." + display_text[-3500:]
+                            # If it's too long, finalize it and start a new message (silent)
+                            await finalize_current_msg()
+                            status_msg = await update.message.reply_text("<i>...continuing...</i>", parse_mode="HTML", disable_notification=True)
+                            return
+
                         try:
                             await status_msg.edit_text(f"{display_text} ▌", parse_mode="HTML")
                             last_update_time = now
                         except: pass
+            
             elif event_type == "tool_use":
+                # Finalize any text before the tool
+                await finalize_current_msg()
+                
                 name = event_data.get("tool_name") or event_data.get("name") or "tool"
-                try: await status_msg.edit_text(f"⚙️ <i>Using: {name}...</i>", parse_mode="HTML")
+                # Send a NEW message for the tool usage (silent)
+                status_msg = await update.message.reply_text(f"⚙️ <i>Using: {name}...</i>", parse_mode="HTML", disable_notification=True)
+                last_update_time = 0
+                
+            elif event_type == "tool_result":
+                # Update the tool message to show completion (silent)
+                try:
+                    await status_msg.edit_text("✅ <i>Tool execution completed.</i>", parse_mode="HTML")
                 except: pass
+                # Prepare for the next message (silent)
+                status_msg = await update.message.reply_text("🤔 <b>Analyzing result...</b>", parse_mode="HTML", disable_notification=True)
+                last_update_time = 0
 
         exit_code, error_msg = await call_gemini_stream(user_input, chat_id, callback)
 
@@ -285,18 +316,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except: pass
             return
 
-        final_text = _format_html_response(full_response)
-        if final_text:
-            try:
-                if len(final_text) < 4000:
-                    await status_msg.edit_text(final_text, parse_mode="HTML")
-                else:
-                    await status_msg.delete()
-                    await _send_long_message(update.message, final_text, parse_mode="HTML")
-            except Exception as e:
-                await _send_long_message(update.message, final_text, parse_mode="HTML")
+        # Finalize the last remaining part of the response. 
+        # Note: If we want the VERY last message to notify, we'd need to send a NEW message instead of editing.
+        # But Telegram doesn't notify on edits. 
+        # To ensure a notification at the end, we can send a small "Done" message if the response was multi-part.
+        if current_buffer:
+            await finalize_current_msg()
+            # If the process was long and involved multiple messages, send a tiny ping
+            # await update.message.reply_text("✅", disable_notification=False)
         else:
-            try: await status_msg.edit_text("✅ <i>Done</i>", parse_mode="HTML")
+            try:
+                if "Thinking..." in status_msg.text or "Analyzing" in status_msg.text:
+                    await status_msg.delete()
             except: pass
 
 
