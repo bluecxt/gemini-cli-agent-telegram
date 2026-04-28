@@ -386,6 +386,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # current_buffer holds the text for the current status_msg
         current_buffer = ""
+        full_response = ""
+        actions_taken = []
         last_update_time = 0
         current_tool_name = "tool"
 
@@ -405,12 +407,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             current_buffer = ""
 
         async def callback(event_type, event_data):
-            nonlocal current_buffer, status_msg, last_update_time, current_tool_name
+            nonlocal current_buffer, full_response, actions_taken, status_msg, last_update_time, current_tool_name
             if STOP_SIGNAL.get(chat_id): return
 
             if event_type == "message" and event_data.get("role") == "assistant":
                 new_content = event_data.get("content", "")
                 current_buffer += new_content
+                full_response += new_content
 
                 now = asyncio.get_event_loop().time()
                 # Periodic live update
@@ -438,14 +441,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 params = event_data.get("parameters") or event_data.get("args") or {}
                 
                 display_name = name
+                p_val = ""
                 if name == "run_shell_command" and "command" in params:
                     cmd = params["command"]
+                    p_val = cmd
                     if len(cmd) > 200:
                         cmd = cmd[:197] + "..."
                     display_name = f"<code>{cmd}</code>"
                 elif name == "read_file" and "file_path" in params:
-                    display_name = f"read <code>{params['file_path']}</code>"
+                    p_val = params['file_path']
+                    display_name = f"read <code>{p_val}</code>"
+                elif "dir_path" in params: p_val = params["dir_path"]
+                elif "pattern" in params: p_val = params["pattern"]
                 
+                p_disp = (str(p_val)[:25] + "...") if len(str(p_val)) > 25 else str(p_val)
+                actions_taken.append((TOOL_MAPPING.get(name, name), p_disp, True))
+                full_response += f"\n[ACTION_INDEX:{len(actions_taken)-1}]\n"
+
                 current_tool_name = display_name
                 LAST_TOOL_USED[chat_id] = name
                 if name == "run_shell_command" and "command" in params:
@@ -492,7 +504,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         CURRENT_DISPLAY_TEXT.pop(chat_id, None)
         if STOP_SIGNAL.get(chat_id): await update.message.reply_text("🛑 <b>Stopped.</b>", parse_mode="HTML"); return
         await _process_and_send_final(update.message, full_response, actions_taken)
-        if exit_code != 0 and not full_response: await update.message.reply_text(f"❌ <b>Error:</b> {err[:500]}", parse_mode="HTML")
+        if exit_code != 0 and not full_response: await update.message.reply_text(f"❌ <b>Error:</b> {error_msg[:500]}", parse_mode="HTML")
 
 
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
