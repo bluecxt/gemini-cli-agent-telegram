@@ -75,30 +75,28 @@ async def _handle_attachments(message: Message) -> str:
 
 
 def _format_html_response(text: str) -> str:
-    """
-    Cleans AI tags and converts Markdown to HTML for Telegram.
-    Telegram HTML supports: <b>, <i>, <code>, <s>, <u>, <pre>.
-    """
-    if not text:
-        return ""
+    """Converts Markdown-like text to Telegram-compatible HTML and hides internal reasoning."""
+    if not text: return ""
 
-    """ 1. Robust thinking formatting """
-    # Convert <thinking>...</thinking> to <i>...</i>
-    clean_text = re.sub(
-        r"<thinking>(.*?)</thinking>", r"<i>\1</i>", text, flags=re.DOTALL
-    )
-    # Handle unclosed <thinking> for live streaming
-    if "<thinking>" in clean_text and "</i>" not in clean_text[clean_text.find("<thinking>"):]:
-        clean_text = clean_text.replace("<thinking>", "<i>") + "</i>"
+    # 1. Capture and format visible thinking
+    def format_thinking(match):
+        content = match.group(1).strip()
+        # Keep it ultra-compact
+        lines = [line.strip() for line in content.split("\n") if line.strip()]
+        return f"<i>{'\n'.join(lines)}</i>" if lines else ""
+
+    # Convert closed thinking tags to italics
+    processed_text = re.sub(r"<thinking>(.*?)</thinking>", format_thinking, text, flags=re.DOTALL)
     
-    # Remove [Thought: ...] blocks but keep the content if it's not in tags
-    clean_text = re.sub(
-        r"\[Thought:.*?\]", "", clean_text, flags=re.DOTALL
-    )
+    # Handle unclosed <thinking> for live streaming (very important)
+    if "<thinking>" in processed_text and "</i>" not in processed_text[processed_text.find("<thinking>"):]:
+        parts = processed_text.split("<thinking>")
+        # Show only the last active thought during stream
+        processed_text = "<i>" + parts[-1].strip() + "</i>"
 
-    clean_text = clean_text.strip()
-    if not clean_text:
-        return ""
+    # STRATEGY: Strip everything that isn't inside <i> (thinking) or isn't our final formatted response.
+    # However, for simplicity and stability, we'll keep the full text and just ensure tags are balanced.
+    clean_text = processed_text.strip()
 
     """ 2. Escape basic HTML to avoid parse errors (except our tags) """
     # We protect our intended tags first
@@ -118,17 +116,26 @@ def _format_html_response(text: str) -> str:
     clean_text = clean_text.replace("[[P]]", "<pre>").replace("[[/P]]", "</pre>")
 
     """ 3. Convert Markdown to HTML """
+    # Convert headers (### title) to Bold
+    clean_text = re.sub(r"^[ \t]*#{1,6}\s*(.*?)[ \t]*$", r"<b>\1</b>", clean_text, flags=re.MULTILINE)
+
     # Code blocks: ```text``` -> <code>text</code>
     clean_text = re.sub(r"```(?:[\w]+)?\n?(.*?)```", r"<code>\1</code>", clean_text, flags=re.DOTALL)
     # Bold: **text** -> <b>text</b>
     clean_text = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", clean_text)
     clean_text = re.sub(r"(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)", r"<i>\1</i>", clean_text)
     clean_text = re.sub(r"`(.*?)`", r"<code>\1</code>", clean_text)
-    replacements = {"&lt;b&gt;": "<b>", "&lt;/b&gt;": "</b>", "&lt;i&gt;": "<i>", "&lt;/i&gt;": "</i>", "&lt;code&gt;": "<code>", "&lt;/code&gt;": "</code>", "&lt;pre&gt;": "<pre>", "&lt;/pre&gt;": "</pre>"}
-    for old, new in replacements.items(): clean_text = clean_text.replace(old, new)
-    return clean_text
-
-    return clean_text
+    
+    replacements = {
+        "&lt;b&gt;": "<b>", "&lt;/b&gt;": "</b>", 
+        "&lt;i&gt;": "<i>", "&lt;/i&gt;": "</i>", 
+        "&lt;code&gt;": "<code>", "&lt;/code&gt;": "</code>", 
+        "&lt;pre&gt;": "<pre>", "&lt;/pre&gt;": "</pre>"
+    }
+    for old, new in replacements.items(): 
+        clean_text = clean_text.replace(old, new)
+    
+    return clean_text.strip()
 
 
 async def _send_long_message(message_obj, text: str, **kwargs):
@@ -154,13 +161,30 @@ async def _send_long_message(message_obj, text: str, **kwargs):
             text = text[split_at:].lstrip()
         try:
             if hasattr(message_obj, "reply_text"): await message_obj.reply_text(chunk, **kwargs)
-            else: await message_obj.send_message(chat_id=MY_ID, text=chunk, **kwargs)
+            else: await message_obj.send_message(chat_id=kwargs.get('chat_id', MY_ID), text=chunk, **kwargs)
         except Exception as e:
             logger.error(f"Error: {e}")
             try:
-                if hasattr(message_obj, "reply_text"): await message_obj.reply_text(chunk)
-                else: await message_obj.send_message(chat_id=MY_ID, text=chunk)
+                if hasattr(message_obj, "reply_text"): await message_obj.reply_text(chunk, disable_notification=kwargs.get('disable_notification', False))
+                else: await message_obj.send_message(chat_id=kwargs.get('chat_id', MY_ID), text=chunk, disable_notification=kwargs.get('disable_notification', False))
             except: pass
+
+
+def _balance_tags(text: str) -> tuple:
+    """Closes open tags and returns prefix for next chunk."""
+    tags = ["b", "i", "code", "pre"]
+    open_tags = []
+    for tag in tags:
+        start_count = len(re.findall(f"<{tag}>", text))
+        end_count = len(re.findall(f"</{tag}>", text))
+        if start_count > end_count: open_tags.append(tag)
+    
+    balanced_text = text
+    next_prefix = ""
+    for tag in reversed(open_tags):
+        balanced_text += f"</{tag}>"
+        next_prefix = f"<{tag}>" + next_prefix
+    return balanced_text, next_prefix
 
 
 def _summarize_actions(actions):
@@ -228,25 +252,35 @@ async def _process_and_send_final(update_msg, full_response, actions_taken, is_s
     pattern = r"(\[SEND_IMAGE:.*?\]|\[ACTION_INDEX:\d+\])"
     parts = re.split(pattern, final_text)
     
+    # We want to notify ONLY on the very last part sent
+    total_parts = len([p for p in parts if p and p.strip()])
+    parts_sent = 0
+
     pending_actions = []
     current_text_block = []
 
     async def flush_text():
-        nonlocal current_text_block
+        nonlocal current_text_block, parts_sent
         text = "".join(current_text_block).strip()
         if text:
-            if is_scheduled: await _send_long_message(GLOBAL_APPLICATION.bot, text, parse_mode="HTML")
-            else: await _send_long_message(update_msg, text, parse_mode="HTML")
+            parts_sent += 1
+            is_last = (parts_sent == total_parts)
+            notif = not is_last # disable_notification=True if NOT last
+            if is_scheduled: await _send_long_message(GLOBAL_APPLICATION.bot, text, parse_mode="HTML", disable_notification=notif)
+            else: await _send_long_message(update_msg, text, parse_mode="HTML", disable_notification=notif)
         current_text_block = []
 
     async def flush_actions():
-        nonlocal pending_actions
+        nonlocal pending_actions, parts_sent
         if pending_actions:
             actions = [actions_taken[i] for i in pending_actions if i < len(actions_taken)]
             report = _summarize_actions(actions)
             if report:
-                if is_scheduled: await GLOBAL_APPLICATION.bot.send_message(chat_id=MY_ID, text=report, parse_mode="HTML")
-                else: await update_msg.reply_text(report, parse_mode="HTML")
+                parts_sent += 1
+                is_last = (parts_sent == total_parts)
+                notif = not is_last
+                if is_scheduled: await GLOBAL_APPLICATION.bot.send_message(chat_id=MY_ID, text=report, parse_mode="HTML", disable_notification=notif)
+                else: await update_msg.reply_text(report, parse_mode="HTML", disable_notification=notif)
             pending_actions = []
 
     for part in parts:
@@ -257,10 +291,13 @@ async def _process_and_send_final(update_msg, full_response, actions_taken, is_s
             await flush_text()
             img_path = part.replace("[SEND_IMAGE:", "").replace("]", "").strip()
             if os.path.exists(img_path):
+                parts_sent += 1
+                is_last = (parts_sent == total_parts)
+                notif = not is_last
                 try:
                     photo = open(img_path, 'rb')
-                    if is_scheduled: await GLOBAL_APPLICATION.bot.send_photo(chat_id=MY_ID, photo=photo, caption=f"🖼️ {os.path.basename(img_path)}")
-                    else: await update_msg.reply_photo(photo=photo, caption=f"🖼️ {os.path.basename(img_path)}")
+                    if is_scheduled: await GLOBAL_APPLICATION.bot.send_photo(chat_id=MY_ID, photo=photo, caption=f"🖼️ {os.path.basename(img_path)}", disable_notification=notif)
+                    else: await update_msg.reply_photo(photo=photo, caption=f"🖼️ {os.path.basename(img_path)}", disable_notification=notif)
                 except Exception as e: logger.error(f"Error sending image: {e}")
             else: logger.warning(f"Image path not found: {img_path}")
         elif part.startswith("[ACTION_INDEX:"):
@@ -486,19 +523,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # Finalize the last remaining part of the response. 
-        # Note: If we want the VERY last message to notify, we'd need to send a NEW message instead of editing.
-        # But Telegram doesn't notify on edits. 
-        # To ensure a notification at the end, we can send a small "Done" message if the response was multi-part.
         if current_buffer:
             await finalize_current_msg()
-            # If the process was long and involved multiple messages, send a tiny ping
-            # await update.message.reply_text("✅", disable_notification=False)
         else:
             try:
                 if "Thinking..." in status_msg.text or "Analyzing" in status_msg.text:
                     await status_msg.delete()
             except: pass
-            ACTIVE_STATUS_MSGS.pop(chat_id)
+            ACTIVE_STATUS_MSGS.pop(chat_id, None)
+        
         LAST_TOOL_USED.pop(chat_id, None)
         CURRENT_COMMANDS.pop(chat_id, None)
         CURRENT_DISPLAY_TEXT.pop(chat_id, None)
