@@ -11,6 +11,16 @@ import os
 os.makedirs("logs", exist_ok=True)
 
 
+class GeminiFilter(logging.Filter):
+    def filter(self, record):
+        msg = record.getMessage()
+        # Filter out YOLO mode warning and pgrep missing warning
+        if "YOLO mode is enabled" in msg:
+            return False
+        if "pgrep: command not found" in msg:
+            return False
+        return True
+
 def setup_logger():
     """Configures a structured logger with console and file output."""
     logger = logging.getLogger("GeminiAgent")
@@ -24,6 +34,7 @@ def setup_logger():
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
     console_handler.setLevel(logging.INFO)
+    console_handler.addFilter(GeminiFilter())
 
     """ File Handler (Rotates at 5MB, keeps 5 backups) """
     file_handler = RotatingFileHandler(
@@ -31,6 +42,7 @@ def setup_logger():
     )
     file_handler.setFormatter(formatter)
     file_handler.setLevel(logging.DEBUG)
+    file_handler.addFilter(GeminiFilter())
 
     logger.addHandler(console_handler)
     logger.addHandler(file_handler)
