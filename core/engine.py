@@ -1,5 +1,5 @@
 """
-Gemini Engine - Core reasoning loop with real-time logs buffering.
+Gemini Engine - Core reasoning loop with robust event decoding.
 """
 
 import json
@@ -13,133 +13,74 @@ from .logger import logger
 ACTIVE_SUBPROCESSES = {}
 STOP_SIGNAL = {}
 LIVE_BUFFERS = {}  # chat_id: deque of strings
-CURRENT_COMMANDS = {}  # chat_id: str
-ERR_STATES = {}    # chat_id: dict to store transient error info
 
 SYSTEM_INSTRUCTIONS = """
-You are the Gemini CLI Agent, a high-performance autonomous engineering assistant.
-You operate within a Docker container. 
+Tu es un agent autonome ultra-concis.
 
-MANDATORY REASONING FORMAT:
-1. INTERNAL REASONING: For complex technical analysis or deep thinking, use an internal monologue. You can be as verbose as needed for technical accuracy.
-2. TELEGRAM DISPLAY: Only the immediate ACTION you are about to take must be wrapped in <thinking> tags. 
-   - These MUST be ultra-compact (ex: <thinking>Reading engine.py</thinking>).
-   - Everything outside these tags will be visible to the user.
-
-MANDATORY FORMATTING:
-- Use <b>bold</b>, <i>italic</i>, <code>inline code</code> and <pre>blocks of code</pre> for Telegram.
-- Use emojis moderately to make the response clear and professional.
-- NEVER use Markdown headers (#). Use <b>bold text</b> for section titles.
-- Final response to the user must be in French (Français). Internal analysis remains in English.
+RÈGLES ABSOLUES :
+1. ACTIONS : Pour voir des fichiers ou toute action système, tu DOIS utiliser un outil (`list_directory`, `run_shell_command`). INTERDICTION de deviner.
+2. RÉFLEXION : Analyse dans <thinking>...</thinking>.
+3. RÉPONSE : En dehors de <thinking>, écris uniquement en FRANÇAIS.
+4. HISTORIQUE : Documente tes changements dans `/app/workspace/HISTORY.md` via shell.
+5. IMAGES : [SEND_IMAGE: /chemin/vers/image.png]
 """
-
 
 def register_process(chat_id, proc):
     if chat_id not in ACTIVE_SUBPROCESSES:
         ACTIVE_SUBPROCESSES[chat_id] = []
     ACTIVE_SUBPROCESSES[chat_id].append(proc)
 
-
 def unregister_process(chat_id, proc):
     if chat_id in ACTIVE_SUBPROCESSES:
-        try:
-            ACTIVE_SUBPROCESSES[chat_id].remove(proc)
-        except ValueError:
-            pass
+        try: ACTIVE_SUBPROCESSES[chat_id].remove(proc)
+        except ValueError: pass
 
+def clear_live_buffer(chat_id):
+    if chat_id in LIVE_BUFFERS:
+        LIVE_BUFFERS[chat_id].clear()
 
-async def _read_stream(stream, chat_id, is_stderr=False):
-    """ Reads a stream line by line and updates the live buffer. """
+async def _read_stderr(stream, chat_id):
     if chat_id not in LIVE_BUFFERS:
-        LIVE_BUFFERS[chat_id] = deque(maxlen=20)
-    
-    if chat_id not in ERR_STATES:
-        ERR_STATES[chat_id] = {"code": None, "msg": None}
-        
+        LIVE_BUFFERS[chat_id] = deque(maxlen=100)
     while True:
-        line = await stream.readline()
-        if not line:
-            break
-        
-        text = line.decode().strip()
-        if text:
-            if is_stderr:
-                # 1. Try to extract common error fields (status, code, message, statusText)
-                m_code = re.search(r"(?:code|status):\s*(\d+)", text)
-                m_msg = re.search(r"(?:message|statusText):\s*['\"]?([^'\",}]+)['\"]?", text)
-                
-                state = ERR_STATES[chat_id]
-                if m_code: state["code"] = m_code.group(1)
-                if m_msg: state["msg"] = m_msg.group(1)
-                
-                # 2. If we have a full pair, emit a clean error
-                if state["code"] and state["msg"]:
-                    formatted = f"❌ <b>Error {state['code']}:</b> {state['msg']}"
-                    if not any(formatted in l for l in LIVE_BUFFERS[chat_id]):
-                        LIVE_BUFFERS[chat_id].append(formatted)
-                    # We don't reset immediately to prevent duplicate noise matches in the same block
-                
-                # 3. Detect if the line is technical noise (Node.js/Gaxios dump)
-                # Matches patterns like "key: value," or "{", "}", "]," etc.
-                is_noise = re.search(r"^[ \t]*[a-zA-Z0-9_]+:.*?,?$", text) or \
-                           text.strip() in ["{", "}", "[", "]", "},", "],", "],"] or \
-                           (text.startswith("'") and (text.endswith("',") or text.endswith("'")))
-                
-                if is_noise:
-                    continue
+        try:
+            line = await stream.readline()
+            if not line: break
+            text = line.decode().strip()
+            if text:
+                LIVE_BUFFERS[chat_id].append(f"stderr: {text}")
+        except: break
 
-                # 4. If it's a meaningful one-liner (CLI logs), show it
-                if any(kw in text.lower() for kw in ["error", "exception", "warning", "failed", "no capacity"]):
-                    # Reset state for the next potential error burst
-                    ERR_STATES[chat_id] = {"code": None, "msg": None}
-                    LIVE_BUFFERS[chat_id].append(f"⚠️ {text}")
-                    logger.warning(f"Gemini Stderr [{chat_id}]: {text}")
-            else:
-                # If it's non-JSON stdout, add to live buffer
-                if not (text.startswith("{") and text.endswith("}")):
-                    LIVE_BUFFERS[chat_id].append(text)
-
+async def get_short_summary(text):
+    if not text or len(text) < 100: return text
+    prompt = f"Résume en une phrase : {text}"
+    args = ["gemini", "--prompt", prompt, "--output-format", "text"]
+    try:
+        p = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, _ = await p.communicate()
+        return out.decode().strip() or text[:200]
+    except: return text[:200]
 
 async def call_gemini_stream(prompt, chat_id, callback):
-    """
-    Calls Gemini CLI and processes JSON events while buffering raw output.
-    """
+    """Loop with robust full-line JSON detection and stats recovery."""
     session_id = get_current_session(chat_id) or "latest"
-    LIVE_BUFFERS[chat_id] = deque(maxlen=20)
-    CURRENT_COMMANDS.pop(chat_id, None)
+    LIVE_BUFFERS[chat_id] = deque(maxlen=100)
+    final_res_data = None
 
-    format_reminder = (
-        "\n\nIMPORTANT FORMATTING RULES:\n"
-        "1. ALL internal monologue, technical analysis, and tool reasoning MUST be in English and inside <thinking> tags.\n"
-        "2. Any text OUTSIDE <thinking> tags MUST be in French (Français) for the user.\n"
-        "3. NEVER use [Thought: ...] or markdown headers for reasoning.\n"
-        "4. To send an image or screenshot to the user, use the syntax: [SEND_IMAGE: /path/to/image.png] outside thinking tags."
-    )
-    full_prompt = f"{SYSTEM_INSTRUCTIONS}{format_reminder}\n\nUSER REQUEST: {prompt}"
-
-    args = [
-        "gemini", "--prompt", "-",
-        "--output-format", "stream-json",
-        "--approval-mode", "yolo"
-    ]
-
+    full_prompt = f"{SYSTEM_INSTRUCTIONS}\n\nUSER REQUEST: {prompt}"
+    args = ["gemini", "--prompt", "-", "--output-format", "stream-json", "--approval-mode", "yolo"]
     if session_id and session_id != "fresh_session":
         args.extend(["--resume", session_id])
 
     env = os.environ.copy()
     env["GEMINI_CLI_TRUST_WORKSPACE"] = "true"
+    env["PAGER"] = "cat"
 
     proc = await asyncio.create_subprocess_exec(
-        *args,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=env
+        *args, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env
     )
     register_process(chat_id, proc)
-
-    # Start background task to read stderr in real-time
-    stderr_task = asyncio.create_task(_read_stream(proc.stderr, chat_id, is_stderr=True))
+    stderr_task = asyncio.create_task(_read_stderr(proc.stderr, chat_id))
 
     try:
         proc.stdin.write(full_prompt.encode())
@@ -148,38 +89,44 @@ async def call_gemini_stream(prompt, chat_id, callback):
 
         while True:
             line = await proc.stdout.readline()
-            if not line:
-                break
-
+            if not line: break
             raw_line = line.decode().strip()
-            if not raw_line:
-                continue
+            if not raw_line: continue
+            
+            logger.debug(f"RAW_STDOUT [{chat_id}]: {raw_line}")
 
-            if not raw_line.startswith("{"):
-                LIVE_BUFFERS[chat_id].append(raw_line)
-                continue
+            # Robust detection: If line starts with JSON signature, attempt full parse
+            if raw_line.startswith('{"type":'):
+                try:
+                    event = json.loads(raw_line)
+                    if event.get("type") == "init" and event.get("session_id"):
+                        set_current_session(chat_id, event.get("session_id"))
+                    
+                    if event.get("type") == "result":
+                        final_res_data = event.get("stats")
+                    
+                    await callback(event.get("type"), event)
+                    continue 
+                except json.JSONDecodeError:
+                    # If JSON is broken/mixed, try partial extraction
+                    match = re.search(r'(\{"type":.*?\})', raw_line)
+                    if match:
+                        try:
+                            event = json.loads(match.group(1))
+                            await callback(event.get("type"), event)
+                            continue
+                        except: pass
 
-            try:
-                event = json.loads(raw_line)
-                e_type = event.get("type")
-
-                if e_type == "init":
-                    sid = event.get("session_id")
-                    if sid:
-                        set_current_session(chat_id, sid)
-
-                await callback(e_type, event)
-
-            except json.JSONDecodeError:
-                LIVE_BUFFERS[chat_id].append(raw_line)
+            # Treat as raw output (TTY/Bash/Logs)
+            LIVE_BUFFERS[chat_id].append(raw_line)
+            await callback("raw_stdout", {"content": raw_line})
 
         await proc.wait()
         await stderr_task
-        return proc.returncode, ""
-
+        return proc.returncode, final_res_data
     except Exception as e:
         logger.exception("ENGINE ERROR")
-        return -1, str(e)
+        return -1, None
     finally:
         unregister_process(chat_id, proc)
         if proc.returncode is None:

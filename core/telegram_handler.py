@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+import html
 from telegram import (
     Update,
     Message,
@@ -26,16 +27,20 @@ from telegram.ext import (
 
 from .config import TOKEN, MY_ID, TMP_DIR, WORKSPACE_DIR, TASKS_FILE
 from .memory import set_current_session
-from .engine import call_gemini_stream, ACTIVE_SUBPROCESSES, STOP_SIGNAL, LIVE_BUFFERS, CURRENT_COMMANDS
-from .logger import logger
+from .engine import call_gemini_stream, get_short_summary, ACTIVE_SUBPROCESSES, STOP_SIGNAL, LIVE_BUFFERS, clear_live_buffer
+from .logger import logger, conv_logger
+
+import whisper
+from gtts import gTTS
+
+# Load Whisper model
+logger.info("Loading Whisper model...")
+WHISPER_MODEL = whisper.load_model("tiny")
 
 CHAT_LOCKS = {}
 GLOBAL_APPLICATION = None
 ACTIVE_STATUS_MSGS = {}  # chat_id: Message object
-LAST_TOOL_USED = {}      # chat_id: str
-CURRENT_DISPLAY_TEXT = {} # chat_id: str (to preserve state)
 
-# Mapping for cleaner action reporting
 TOOL_MAPPING = {
     "list_directory": "ReadFolder",
     "read_file": "ReadFile",
@@ -44,373 +49,84 @@ TOOL_MAPPING = {
     "run_shell_command": "Bash",
     "grep_search": "Search",
     "google_web_search": "WebSearch",
-    "web_fetch": "WebRead"
+    "web_fetch": "WebRead",
+    "invoke_agent": "SubAgent"
+}
+
+TOOL_ICONS = {
+    "invoke_agent": "👥",
+    "run_shell_command": "🛠️",
+    "google_web_search": "🌐",
+    "web_fetch": "📖"
 }
 
 
 def is_not_user(update: Update) -> bool:
-    """Checks if the message is from the authorized user."""
     user_id = update.effective_user.id
     if user_id != MY_ID:
-        logger.warning(f"Unauthorized access attempt from ID: {user_id}")
+        logger.warning(f"Unauthorized: {user_id}")
         return True
     return False
 
 
 async def _handle_attachments(message: Message) -> str:
-    """Downloads attachments and returns the updated user input string."""
     user_input = message.text or ""
-    if not (message.photo or message.document):
+    if message.voice or message.audio:
+        try:
+            audio_obj = await (message.voice or message.audio).get_file()
+            audio_path = os.path.join(TMP_DIR, audio_obj.file_path.split('/')[-1])
+            await audio_obj.download_to_drive(audio_path)
+            result = WHISPER_MODEL.transcribe(audio_path, language="fr")
+            transcription = result.get("text", "").strip()
+            if transcription: user_input = f"{transcription}\n[VOICE_TRANSCRIPTION]"
+        except Exception as e: logger.error(f"STT Error: {e}")
         return user_input
+    if not (message.photo or message.document): return user_input
     try:
         file_obj = await (message.photo[-1] if message.photo else message.document).get_file()
         file_path = os.path.join(TMP_DIR, file_obj.file_path.split('/')[-1])
         await file_obj.download_to_drive(file_path)
-        caption = message.caption or "Analysis"
-        user_input = f"{caption}\n[FILE: {file_path}]"
-        logger.info(f"Telegram Attachment downloaded: {file_path}")
-    except Exception as e:
-        logger.error(f"Error receiving file: {e}")
+        user_input = f"{message.caption or 'Analysis'}\n[FILE: {file_path}]"
+    except Exception as e: logger.error(f"File Error: {e}")
     return user_input
 
 
-def _format_html_response(text: str) -> str:
-    """Converts Markdown-like text to Telegram-compatible HTML and hides internal reasoning."""
+def _get_clean_user_text(text: str) -> str:
     if not text: return ""
+    text = re.sub(r"\[(ACTION_INDEX|VOICE_TRANSCRIPTION|FILE|SEND_IMAGE):.*?\]", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    if "<thinking" in text.lower(): text = re.split(r"<thinking", text, flags=re.IGNORECASE)[0]
+    return text.strip()
 
-    # 1. Capture and format visible thinking
-    def format_thinking(match):
-        content = match.group(1).strip()
-        # Keep it ultra-compact
-        lines = [line.strip() for line in content.split("\n") if line.strip()]
-        if not lines:
-            return ""
-        content_joined = "\n".join(lines)
-        return f"<i>{content_joined}</i>"
 
-    # Convert closed thinking tags to italics
-    processed_text = re.sub(r"<thinking>(.*?)</thinking>", format_thinking, text, flags=re.DOTALL)
-    
-    # Handle unclosed <thinking> for live streaming (very important)
-    if "<thinking>" in processed_text and "</i>" not in processed_text[processed_text.find("<thinking>"):]:
-        parts = processed_text.split("<thinking>")
-        # Show only the last active thought during stream
-        processed_text = "<i>" + parts[-1].strip() + "</i>"
-
-    clean_text = processed_text.strip()
-
-    """ 2. Escape basic HTML to avoid parse errors (except our tags) """
-    # We protect our intended tags first
-    clean_text = clean_text.replace("<b>", "[[B]]").replace("</b>", "[[/B]]")
-    clean_text = clean_text.replace("<i>", "[[I]]").replace("</i>", "[[/I]]")
-    clean_text = clean_text.replace("<code>", "[[C]]").replace("</code>", "[[/C]]")
-    clean_text = clean_text.replace("<pre>", "[[P]]").replace("</pre>", "[[/P]]")
-
-    clean_text = clean_text.replace("&", "&amp;")
-    clean_text = clean_text.replace("<", "&lt;")
-    clean_text = clean_text.replace(">", "&gt;")
-
-    # Restore our tags
-    clean_text = clean_text.replace("[[B]]", "<b>").replace("[[/B]]", "</b>")
-    clean_text = clean_text.replace("[[I]]", "<i>").replace("[[/I]]", "</i>")
-    clean_text = clean_text.replace("[[C]]", "<code>").replace("[[/C]]", "</code>")
-    clean_text = clean_text.replace("[[P]]", "<pre>").replace("[[/P]]", "</pre>")
-
-    """ 3. Convert Markdown to HTML """
-    # Convert headers (### title) to Bold
+def _format_html_response(text: str) -> str:
+    clean_text = _get_clean_user_text(text)
+    if not clean_text: return ""
+    clean_text = clean_text.replace("<b>", "[[B]]").replace("</b>", "[[/B]]").replace("<i>", "[[I]]").replace("</i>", "[[/I]]").replace("<code>", "[[C]]").replace("</code>", "[[/C]]").replace("<pre>", "[[P]]").replace("</pre>", "[[/P]]")
+    clean_text = html.escape(clean_text)
+    clean_text = clean_text.replace("[[B]]", "<b>").replace("[[/B]]", "</b>").replace("[[I]]", "<i>").replace("[[/I]]", "</i>").replace("[[C]]", "<code>").replace("[[/C]]", "</code>").replace("[[P]]", "<pre>").replace("[[/P]]", "</pre>")
     clean_text = re.sub(r"^[ \t]*#{1,6}\s*(.*?)[ \t]*$", r"<b>\1</b>", clean_text, flags=re.MULTILINE)
-
-    # Code blocks: ```text``` -> <code>text</code>
     clean_text = re.sub(r"```(?:[\w]+)?\n?(.*?)```", r"<code>\1</code>", clean_text, flags=re.DOTALL)
-    # Bold: **text** -> <b>text</b>
     clean_text = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", clean_text)
     clean_text = re.sub(r"(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)", r"<i>\1</i>", clean_text)
     clean_text = re.sub(r"`(.*?)`", r"<code>\1</code>", clean_text)
-    
-    replacements = {
-        "&lt;b&gt;": "<b>", "&lt;/b&gt;": "</b>", 
-        "&lt;i&gt;": "<i>", "&lt;/i&gt;": "</i>", 
-        "&lt;code&gt;": "<code>", "&lt;/code&gt;": "</code>", 
-        "&lt;pre&gt;": "<pre>", "&lt;/pre&gt;": "</pre>"
-    }
-    for old, new in replacements.items(): 
-        clean_text = clean_text.replace(old, new)
-    
     return clean_text.strip()
 
 
-async def _send_long_message(message_obj, text: str, **kwargs):
-    """Sends long message in chunks."""
-    if not text: return
-    limit = 3900
-    current_prefix = ""
-    is_html = kwargs.get("parse_mode") == "HTML"
-    while len(text) > 0:
-        if len(text) <= limit:
-            chunk = current_prefix + text
-            text = ""
-        else:
-            split_at = text.rfind("\n", 0, limit)
-            if split_at == -1: split_at = text.rfind(" ", 0, limit)
-            if split_at == -1: split_at = limit
-            raw_chunk = text[:split_at]
-            if is_html:
-                balanced_chunk, next_prefix = _balance_tags(raw_chunk)
-                chunk = current_prefix + balanced_chunk
-                current_prefix = next_prefix
-            else: chunk = raw_chunk
-            text = text[split_at:].lstrip()
-        try:
-            if hasattr(message_obj, "reply_text"): await message_obj.reply_text(chunk, **kwargs)
-            else: await message_obj.send_message(chat_id=kwargs.get('chat_id', MY_ID), text=chunk, **kwargs)
-        except Exception as e:
-            logger.error(f"Error: {e}")
-            try:
-                if hasattr(message_obj, "reply_text"): await message_obj.reply_text(chunk, disable_notification=kwargs.get('disable_notification', False))
-                else: await message_obj.send_message(chat_id=kwargs.get('chat_id', MY_ID), text=chunk, disable_notification=kwargs.get('disable_notification', False))
-            except: pass
-
-
-def _balance_tags(text: str) -> tuple:
-    """Closes open tags and returns prefix for next chunk."""
-    tags = ["b", "i", "code", "pre"]
-    open_tags = []
-    for tag in tags:
-        start_count = len(re.findall(f"<{tag}>", text))
-        end_count = len(re.findall(f"</{tag}>", text))
-        if start_count > end_count: open_tags.append(tag)
-    
-    balanced_text = text
-    next_prefix = ""
-    for tag in reversed(open_tags):
-        balanced_text += f"</{tag}>"
-        next_prefix = f"<{tag}>" + next_prefix
-    return balanced_text, next_prefix
-
-
-def _summarize_actions(actions):
-    """Summarizes tool actions."""
-    if not actions: return ""
-    summary_lines, current_group = [], []
-    for name, param, has_text_before in actions:
-        # Wrap param in code tags
-        formatted_param = f"<code>{param}</code>" if param else ""
-        if has_text_before or not current_group:
-            if current_group: summary_lines.append(", ".join(current_group))
-            current_group = [f"{name} {formatted_param}"]
-        else: current_group.append(f"{name} {formatted_param}")
-    if current_group: summary_lines.append(", ".join(current_group))
-    return "\n".join([f"🛠️ {line}" for line in summary_lines])
-
-
-async def _refresh_thinking_msg(chat_id):
-    """Deletes the current thinking message and sends a new one at the bottom."""
-    text = CURRENT_DISPLAY_TEXT.get(chat_id, "🤔 <b>Thinking...</b>")
-    if chat_id in ACTIVE_STATUS_MSGS:
-        try: await ACTIVE_STATUS_MSGS[chat_id].delete()
-        except: pass
-    if GLOBAL_APPLICATION:
-        try:
-            new_msg = await GLOBAL_APPLICATION.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
-            ACTIVE_STATUS_MSGS[chat_id] = new_msg
-            return new_msg
-        except: pass
-    return None
+async def _reply_with_voice(chat_id, text: str, reply_to_message_id=None):
+    try:
+        clean = re.sub(r'<[^>]+>', '', _get_clean_user_text(text))
+        if not clean.strip(): return
+        path = os.path.join(TMP_DIR, f"reply_{int(asyncio.get_event_loop().time())}.mp3")
+        gTTS(text=clean, lang='fr').save(path)
+        with open(path, 'rb') as v:
+            await GLOBAL_APPLICATION.bot.send_voice(chat_id=chat_id, voice=v, reply_to_message_id=reply_to_message_id)
+    except: pass
 
 
 async def trigger_scheduled_task(prompt: str):
-    """Automated task runner."""
     if not GLOBAL_APPLICATION: return
-    logger.info(f"Scheduled task: {prompt[:50]}")
-    status_msg = await GLOBAL_APPLICATION.bot.send_message(chat_id=MY_ID, text="🤔 <b>Thinking...</b>", parse_mode="HTML")
-    ACTIVE_STATUS_MSGS[MY_ID] = status_msg
-    CURRENT_DISPLAY_TEXT[MY_ID] = "🤔 <b>Thinking...</b>"
-    full_response, actions_taken = "", []
-    async def callback(e_type, e_data):
-        nonlocal full_response
-        if e_type == "message" and e_data.get("role") == "assistant":
-            full_response += e_data.get("content", "")
-        elif e_type == "tool_use":
-            name = e_data.get("tool_name") or e_data.get("name") or "tool"
-            LAST_TOOL_USED[MY_ID] = name
-            params = e_data.get("parameters", {})
-            p_val = params.get("file_path") or params.get("dir_path") or params.get("command") or params.get("pattern") or ""
-            p_disp = (str(p_val)[:25] + "...") if len(str(p_val)) > 25 else str(p_val)
-            actions_taken.append((TOOL_MAPPING.get(name, name), p_disp, True))
-            full_response += f"\n[ACTION_INDEX:{len(actions_taken)-1}]\n"
-            if name == "run_shell_command": CURRENT_COMMANDS[MY_ID] = str(p_val)
-    await call_gemini_stream(prompt, MY_ID, callback)
-    try: await status_msg.delete()
-    except: pass
-    ACTIVE_STATUS_MSGS.pop(MY_ID, None)
-    LAST_TOOL_USED.pop(MY_ID, None)
-    CURRENT_DISPLAY_TEXT.pop(MY_ID, None)
-    await _process_and_send_final(None, full_response, actions_taken, is_scheduled=True)
-
-
-async def _process_and_send_final(update_msg, full_response, actions_taken, is_scheduled=False):
-    """Interleaves text, images and tool actions in correct order."""
-    final_text = _format_html_response(full_response)
-    # Split by images and action markers
-    pattern = r"(\[SEND_IMAGE:.*?\]|\[ACTION_INDEX:\d+\])"
-    parts = re.split(pattern, final_text)
-    
-    # We want to notify ONLY on the very last part sent
-    total_parts = len([p for p in parts if p and p.strip()])
-    parts_sent = 0
-
-    pending_actions = []
-    current_text_block = []
-
-    async def flush_text():
-        nonlocal current_text_block, parts_sent
-        text = "".join(current_text_block).strip()
-        if text:
-            parts_sent += 1
-            is_last = (parts_sent == total_parts)
-            notif = not is_last # disable_notification=True if NOT last
-            if is_scheduled: await _send_long_message(GLOBAL_APPLICATION.bot, text, parse_mode="HTML", disable_notification=notif)
-            else: await _send_long_message(update_msg, text, parse_mode="HTML", disable_notification=notif)
-        current_text_block = []
-
-    async def flush_actions():
-        nonlocal pending_actions, parts_sent
-        if pending_actions:
-            actions = [actions_taken[i] for i in pending_actions if i < len(actions_taken)]
-            report = _summarize_actions(actions)
-            if report:
-                parts_sent += 1
-                is_last = (parts_sent == total_parts)
-                notif = not is_last
-                if is_scheduled: await GLOBAL_APPLICATION.bot.send_message(chat_id=MY_ID, text=report, parse_mode="HTML", disable_notification=notif)
-                else: await update_msg.reply_text(report, parse_mode="HTML", disable_notification=notif)
-            pending_actions = []
-
-    for part in parts:
-        if not part or not part.strip(): continue
-        
-        if part.startswith("[SEND_IMAGE:"):
-            await flush_actions()
-            await flush_text()
-            img_path = part.replace("[SEND_IMAGE:", "").replace("]", "").strip()
-            if os.path.exists(img_path):
-                parts_sent += 1
-                is_last = (parts_sent == total_parts)
-                notif = not is_last
-                try:
-                    photo = open(img_path, 'rb')
-                    if is_scheduled: await GLOBAL_APPLICATION.bot.send_photo(chat_id=MY_ID, photo=photo, caption=f"🖼️ {os.path.basename(img_path)}", disable_notification=notif)
-                    else: await update_msg.reply_photo(photo=photo, caption=f"🖼️ {os.path.basename(img_path)}", disable_notification=notif)
-                except Exception as e: logger.error(f"Error sending image: {e}")
-            else: logger.warning(f"Image path not found: {img_path}")
-        elif part.startswith("[ACTION_INDEX:"):
-            await flush_text()
-            try:
-                idx = int(re.search(r"\d+", part).group())
-                pending_actions.append(idx)
-            except: pass
-        else:
-            await flush_actions()
-            current_text_block.append(part)
-            
-    await flush_actions()
-    await flush_text()
-
-
-async def chat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if is_not_user(update): return
-    chat_id = update.effective_chat.id
-    args = context.args
-    if not args:
-        try:
-            res = subprocess.check_output(["gemini", "--list-sessions"], text=True)
-            await update.message.reply_text(f"<pre>{res}</pre>", parse_mode="HTML")
-        except Exception as e: await update.message.reply_text(f"Error: {e}")
-    else:
-        target = args[0].lower()
-        if target == "new":
-            set_current_session(chat_id, "fresh_session")
-            await update.message.reply_text("✨ <b>New session started!</b>", parse_mode="HTML")
-        else:
-            try:
-                res = subprocess.check_output(["gemini", "--list-sessions"], text=True)
-                session_id = None
-                for line in res.splitlines():
-                    if f"{target}." in line or target in line:
-                        match = re.search(r"\[(.*?)\]", line)
-                        if match: session_id = match.group(1); break
-                if session_id:
-                    set_current_session(chat_id, session_id)
-                    await update.message.reply_text(f"✅ Switched: <code>{session_id}</code>", parse_mode="HTML")
-                else: await update.message.reply_text("❌ Not found.")
-            except Exception as e: await update.message.reply_text(f"Error: {e}")
-    if chat_id in ACTIVE_STATUS_MSGS: await _refresh_thinking_msg(chat_id)
-
-
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if is_not_user(update): return
-    chat_id = update.effective_chat.id
-    procs = ACTIVE_SUBPROCESSES.get(chat_id, [])
-    
-    if not procs:
-        await update.message.reply_text("😴 <b>Status:</b> Idle", parse_mode="HTML")
-        return
-
-    last_tool = LAST_TOOL_USED.get(chat_id, "Thinking")
-    
-    status = (
-        f"🚀 <b>Agent Status</b>\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"👥 <b>Active Processes:</b> {len(procs)}\n"
-        f"🎯 <b>Current Activity:</b> <code>{last_tool}</code>\n"
-    )
-    
-    if chat_id in CURRENT_COMMANDS:
-        status += f"💻 <b>Executing:</b> <code>{CURRENT_COMMANDS[chat_id]}</code>\n"
-    
-    if chat_id in LIVE_BUFFERS and LIVE_BUFFERS[chat_id]:
-        logs = "\n".join(LIVE_BUFFERS[chat_id]).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        status += f"\n📝 <b>Live Logs:</b>\n<pre>{logs}</pre>"
-    
-    await update.message.reply_text(status, parse_mode="HTML")
-    if chat_id in ACTIVE_STATUS_MSGS: await _refresh_thinking_msg(chat_id)
-
-
-async def tasks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if is_not_user(update): return
-    if not os.path.exists(TASKS_FILE): await update.message.reply_text("ℹ️ No tasks."); return
-    import json
-    with open(TASKS_FILE, 'r') as f: tasks = json.load(f)
-    if not tasks: await update.message.reply_text("ℹ️ Empty."); return
-    text = "📋 <b>Tasks:</b>\n\n"
-    keyboard = [[InlineKeyboardButton(f"❌ {t['name']}", callback_data=f"del_task_{i}")] for i, t in enumerate(tasks)]
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
-
-
-async def update_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if is_not_user(update): return
-    msg = await update.message.reply_text("🔄 <b>Updating...</b>", parse_mode="HTML")
-    try:
-        proc = await asyncio.create_subprocess_shell("npm install -g @google/gemini-cli@nightly", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        await proc.communicate()
-        if proc.returncode == 0:
-            await msg.edit_text("✅ <b>Updated!</b> Restarting...", parse_mode="HTML")
-            os.execv(sys.executable, ['python'] + sys.argv)
-        else: await msg.edit_text("❌ Failed.", parse_mode="HTML")
-    except Exception as e: await msg.edit_text(f"❌ Error: {e}", parse_mode="HTML")
-
-
-async def task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data.startswith("del_task_"):
-        import json
-        idx = int(query.data.split("_")[-1])
-        with open(TASKS_FILE, 'r') as f: tasks = json.load(f)
-        if 0 <= idx < len(tasks):
-            removed = tasks.pop(idx)
-            with open(TASKS_FILE, 'w') as f: json.dump(tasks, f, indent=4)
-            await query.edit_message_text(f"✅ Deleted: <b>{removed['name']}</b>", parse_mode="HTML")
+    await _process_request(MY_ID, prompt)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -419,182 +135,250 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_id not in CHAT_LOCKS: CHAT_LOCKS[chat_id] = asyncio.Lock()
     async with CHAT_LOCKS[chat_id]:
         user_input = await _handle_attachments(update.message)
-        STOP_SIGNAL[chat_id] = False
+        conv_logger.info(f"USER [{chat_id}]: {user_input}")
+        await _process_request(chat_id, user_input, update.message)
 
-        # Initial thinking message is silent
-        status_msg = await update.message.reply_text("🤔 <b>Thinking...</b>", parse_mode="HTML", disable_notification=True)
-        
-        # State for tool results
-        current_buffer = ""
-        full_response = ""
-        actions_taken = []
-        last_update_time = 0
-        current_tool_name = "tool"
-        current_tool_raw_name = ""
 
-        async def finalize_current_msg(is_final=False):
-            """Edits the current status_msg one last time and resets the buffer."""
-            nonlocal status_msg, current_buffer
-            if not current_buffer:
-                return
+async def _process_request(chat_id, user_input, origin_message=None):
+    STOP_SIGNAL[chat_id] = False
+    
+    async def send_msg(text, silent=True):
+        try:
+            if origin_message: return await origin_message.reply_text(text, parse_mode="HTML", disable_notification=silent)
+            return await GLOBAL_APPLICATION.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", disable_notification=silent)
+        except Exception as e:
+            logger.error(f"TG Send Error: {e}")
+            if origin_message: return await origin_message.reply_text(text[:4000], disable_notification=silent)
+            return await GLOBAL_APPLICATION.bot.send_message(chat_id=chat_id, text=text[:4000], disable_notification=silent)
 
-            clean = _format_html_response(current_buffer)
-            if clean:
+    # Floating Cursor
+    cursor_msg = await send_msg("🤔 <b>Thinking...</b>")
+
+    current_buffer, full_response, last_update_time = "", "", 0
+    assistant_msg = None
+    active_tools = {} # tid -> {msg_obj, header, output}
+    final_stats = None
+
+    async def rotate_cursor():
+        nonlocal cursor_msg
+        old = cursor_msg
+        cursor_msg = await send_msg("🤔 <b>Thinking...</b>")
+        try: await old.delete()
+        except: pass
+
+    async def handle_images(text):
+        matches = list(re.finditer(r"\[SEND_IMAGE:\s*(.*?)\]", text, re.IGNORECASE))
+        for m in matches:
+            path = m.group(1).strip()
+            if not os.path.exists(path): path = os.path.join(WORKSPACE_DIR, os.path.basename(path))
+            if os.path.exists(path):
                 try:
-                    # Editing a message never triggers a notification anyway
-                    await status_msg.edit_text(clean, parse_mode="HTML")
-                except:
-                    pass
-            current_buffer = ""
-
-        async def callback(event_type, event_data):
-            nonlocal current_buffer, full_response, actions_taken, status_msg, last_update_time, current_tool_name, current_tool_raw_name
-            if STOP_SIGNAL.get(chat_id): return
-
-            if event_type == "message" and event_data.get("role") == "assistant":
-                new_content = event_data.get("content", "")
-                current_buffer += new_content
-                full_response += new_content
-
-                now = asyncio.get_event_loop().time()
-                # Periodic live update
-                if now - last_update_time > 1.0:
-                    clean = _format_html_response(current_buffer)
-                    if clean:
-                        # Truncate for live display if getting very long
-                        display_text = clean
-                        if len(display_text) > 3500:
-                            # If it's too long, finalize it and start a new message (silent)
-                            await finalize_current_msg()
-                            status_msg = await update.message.reply_text("<i>...continuing...</i>", parse_mode="HTML", disable_notification=True)
-                            return
-
-                        try:
-                            await status_msg.edit_text(f"{display_text} ▌", parse_mode="HTML")
-                            last_update_time = now
-                        except: pass
-
-            elif event_type == "tool_use":
-                # Finalize any text before the tool
-                await finalize_current_msg()
-
-                name = event_data.get("tool_name") or event_data.get("name") or "tool"
-                current_tool_raw_name = name
-                params = event_data.get("parameters") or event_data.get("args") or {}
-                
-                tool_nick = TOOL_MAPPING.get(name, name)
-                p_val = ""
-                
-                if name == "run_shell_command" and "command" in params:
-                    p_val = params["command"]
-                elif name == "read_file" and "file_path" in params:
-                    p_val = params['file_path']
-                elif "file_path" in params: p_val = params["file_path"]
-                elif "dir_path" in params: p_val = params["dir_path"]
-                elif "pattern" in params: p_val = params["pattern"]
-                
-                # Truncate for the internal tracking (live display)
-                p_disp = (str(p_val)[:500] + "...") if len(str(p_val)) > 500 else str(p_val)
-                display_name = f"{tool_nick} <code>{p_disp}</code>" if p_disp else tool_nick
-                
-                # For the final summary, use a reasonably long version
-                p_short = (str(p_val)[:100] + "...") if len(str(p_val)) > 100 else str(p_val)
-                actions_taken.append((tool_nick, p_short, True))
-                full_response += f"\n[ACTION_INDEX:{len(actions_taken)-1}]\n"
-
-                current_tool_name = display_name
-                LAST_TOOL_USED[chat_id] = name
-                if name == "run_shell_command" and "command" in params:
-                    CURRENT_COMMANDS[chat_id] = params["command"]
-
-                # Send a NEW message for the tool usage (silent)
-                status_msg = await update.message.reply_text(f"🛠️ {display_name}", parse_mode="HTML", disable_notification=True)
-                last_update_time = 0
-
-            elif event_type == "tool_result":
-                # Update the tool message to show completion (silent)
-                try:
-                    await status_msg.edit_text(f"🛠️ {current_tool_name}", parse_mode="HTML")
+                    with open(path, 'rb') as p:
+                        if origin_message: await origin_message.reply_photo(p, caption=f"📸 {os.path.basename(path)}", disable_notification=True)
+                        else: await GLOBAL_APPLICATION.bot.send_photo(chat_id=chat_id, photo=p, caption=f"📸 {os.path.basename(path)}", disable_notification=True)
+                    await rotate_cursor()
                 except: pass
 
-                # If it's a Bash command, send the last 5 lines of output (silent)
-                if current_tool_raw_name == "run_shell_command":
-                    output = event_data.get("output", "")
-                    if output:
-                        lines = output.strip().split("\n")
-                        last_lines = "\n".join(lines[-5:])
-                        if last_lines:
-                            # Escape for HTML
-                            safe_output = last_lines.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                            await update.message.reply_text(f"<pre>{safe_output}</pre>", parse_mode="HTML", disable_notification=True)
-                
-                LAST_TOOL_USED[chat_id] = "Analyzing result"
-                # Prepare for the next message (silent)
-                status_msg = await update.message.reply_text("🤔 <b>Thinking...</b>", parse_mode="HTML", disable_notification=True)
-                last_update_time = 0
-        
-        exit_code, error_msg = await call_gemini_stream(user_input, chat_id, callback)
+    async def callback(e_type, e_data):
+        nonlocal current_buffer, full_response, cursor_msg, last_update_time, assistant_msg, active_tools, final_stats
+        if STOP_SIGNAL.get(chat_id): return
 
-        if STOP_SIGNAL.get(chat_id):
-            try: await status_msg.edit_text("🛑 <b>Stopped.</b>", parse_mode="HTML")
+        if e_type == "message" and e_data.get("role") == "assistant":
+            content = e_data.get("content", "")
+            if not content: return
+            
+            if not assistant_msg:
+                assistant_msg = await send_msg("▌")
+                await rotate_cursor()
+            
+            current_buffer += content
+            full_response += content
+
+            now = asyncio.get_event_loop().time()
+            if now - last_update_time > 1.5 and current_buffer:
+                clean = _format_html_response(current_buffer)
+                if clean:
+                    try: await assistant_msg.edit_text(f"{clean} ▌", parse_mode="HTML")
+                    except: pass
+                    last_update_time = now
+
+        elif e_type == "tool_use":
+            if assistant_msg and current_buffer:
+                try: await assistant_msg.edit_text(_format_html_response(current_buffer), parse_mode="HTML")
+                except: pass
+            current_buffer = ""
+            assistant_msg = None
+            clear_live_buffer(chat_id)
+            
+            name = e_data.get("tool_name") or e_data.get("name") or "tool"
+            tid = e_data.get("tool_id") or e_data.get("id") or f"idx_{len(active_tools)}"
+            params = e_data.get("parameters") or e_data.get("args") or {}
+            
+            if "HISTORY.md" in str(params):
+                active_tools[tid] = {"silent": True}
+                return
+
+            nick, icon = TOOL_MAPPING.get(name, name), TOOL_ICONS.get(name, "🛠️")
+            p_val = params.get("command") or params.get("file_path") or params.get("dir_path") or ""
+            p_disp = html.escape((str(p_val)[:50] + "...") if len(str(p_val)) > 50 else str(p_val))
+            header = f"{icon} {nick} <code>{p_disp}</code>"
+            
+            tool_msg = await send_msg(header)
+            await rotate_cursor()
+            
+            active_tools[tid] = {"msg": tool_msg, "header": header, "output": ""}
+            conv_logger.info(f"TOOL [{chat_id}] {name}: {p_val}")
+
+        elif e_type == "raw_stdout":
+            content = e_data.get("content", "")
+            if not active_tools: return
+            last_tid = list(active_tools.keys())[-1]
+            t_info = active_tools[last_tid]
+            if t_info.get("silent"): return
+            
+            t_info["output"] += content + "\n"
+            lines = t_info["output"].strip().split("\n")
+            snippet = html.escape("\n".join(lines[-12:]))
+            try: await t_info["msg"].edit_text(f"{t_info['header']}\n<pre>{snippet}</pre>", parse_mode="HTML")
             except: pass
-            return
 
-        # Finalize the last remaining part of the response. 
-        if current_buffer:
-            await finalize_current_msg()
-        else:
-            try:
-                if "Thinking..." in status_msg.text or "Analyzing" in status_msg.text:
-                    await status_msg.delete()
-            except: pass
-            ACTIVE_STATUS_MSGS.pop(chat_id, None)
-        
-        LAST_TOOL_USED.pop(chat_id, None)
-        CURRENT_COMMANDS.pop(chat_id, None)
-        CURRENT_DISPLAY_TEXT.pop(chat_id, None)
-        if STOP_SIGNAL.get(chat_id): await update.message.reply_text("🛑 <b>Stopped.</b>", parse_mode="HTML"); return
-        await _process_and_send_final(update.message, full_response, actions_taken)
-        if exit_code != 0 and not full_response: await update.message.reply_text(f"❌ <b>Error:</b> {error_msg[:500]}", parse_mode="HTML")
+        elif e_type == "tool_result":
+            tid = e_data.get("tool_id") or e_data.get("id")
+            t_info = active_tools.get(tid)
+            if not t_info and active_tools: t_info = list(active_tools.values())[-1]
+            if not t_info or t_info.get("silent"): return
+            
+            # Robust extraction of tool result output
+            raw_out = e_data.get("output")
+            if (raw_out is None or (isinstance(raw_out, str) and not raw_out.strip())) and chat_id in LIVE_BUFFERS:
+                raw_out = "\n".join(list(LIVE_BUFFERS[chat_id]))
+            
+            output = str(raw_out or "")
+            conv_logger.info(f"RESULT [{chat_id}] {tid}: {output[:500]}...")
+            await handle_images(output)
+            clean_output = re.sub(r"\[SEND_IMAGE:.*?\]", "", output, flags=re.IGNORECASE)
+            
+            if t_info["msg"]:
+                if clean_output.strip():
+                    lines = clean_output.strip().split("\n")
+                    safe = html.escape("\n".join(lines[-20:])) # More lines for result
+                    try: await t_info["msg"].edit_text(f"{t_info['header']}\n<pre>{safe}</pre>", parse_mode="HTML")
+                    except:
+                        try: await t_info["msg"].edit_text(f"{t_info['header']}\n{safe[:1000]}")
+                        except: pass
+                else:
+                    try: await t_info["msg"].edit_text(t_info['header'], parse_mode="HTML") # Remove ✅ here
+                    except: pass
+            assistant_msg = None
+
+        elif e_type == "result":
+            final_stats = e_data.get("stats")
+
+        elif e_type == "error":
+            severity, msg = e_data.get("severity", "error"), e_data.get("message", "Unknown error")
+            icon = "⚠️" if severity == "warning" else "❌"
+            await send_msg(f"{icon} <b>Quota/API {severity.capitalize()}:</b>\n<code>{html.escape(msg)}</code>")
+            await rotate_cursor()
+
+    exit_code, final_stats = await call_gemini_stream(user_input, chat_id, callback)
+
+    if assistant_msg and current_buffer:
+        try: await assistant_msg.edit_text(_format_html_response(current_buffer), parse_mode="HTML")
+        except: pass
+    
+    conv_logger.info(f"AGENT [{chat_id}]: {full_response}")
+    if "[VOICE_TRANSCRIPTION]" in user_input and full_response:
+        summary = await get_short_summary(full_response)
+        await _reply_with_voice(chat_id, summary, reply_to_message_id=origin_message.message_id if origin_message else None)
+
+    try: await cursor_msg.delete()
+    except: pass
+    
+    if final_stats:
+        tokens, dur = final_stats.get("total_tokens", 0), final_stats.get("duration_ms", 0) / 1000
+        if tokens > 0:
+            txt = f"<code>💎 {tokens} tokens | ⏱️ {dur:.1f}s</code>"
+            await send_msg(txt)
 
 
-async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def stop_cmd(update, context):
     if is_not_user(update): return
-    chat_id = update.effective_chat.id
-    STOP_SIGNAL[chat_id] = True
-    procs = ACTIVE_SUBPROCESSES.get(chat_id, [])
-    for p in procs:
+    STOP_SIGNAL[update.effective_chat.id] = True
+    for p in ACTIVE_SUBPROCESSES.get(update.effective_chat.id, []):
         try: p.kill()
         except: pass
     await update.message.reply_text("🛑 Stopped.", parse_mode="HTML")
-    ACTIVE_STATUS_MSGS.pop(chat_id, None)
-    LAST_TOOL_USED.pop(chat_id, None)
-    CURRENT_COMMANDS.pop(chat_id, None)
-    CURRENT_DISPLAY_TEXT.pop(chat_id, None)
 
+async def status_cmd(update, context):
+    if is_not_user(update): return
+    procs = ACTIVE_SUBPROCESSES.get(update.effective_chat.id, [])
+    if not procs: return await update.message.reply_text("😴 Idle")
+    s = f"🚀 <b>Agent Status</b>\n━━━━━━━━━━━━━━━\n👥 <b>Active:</b> {len(procs)}\n"
+    if update.effective_chat.id in LIVE_BUFFERS:
+        logs = html.escape("\n".join(LIVE_BUFFERS[update.effective_chat.id]))
+        s += f"\n📝 <b>Logs:</b>\n<pre>{logs[-1000:]}</pre>"
+    await update.message.reply_text(s, parse_mode="HTML")
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Telegram Error: {context.error}")
+async def tasks_cmd(update, context):
+    if is_not_user(update): return
+    if not os.path.exists(TASKS_FILE): return await update.message.reply_text("Empty")
+    import json
+    with open(TASKS_FILE, 'r') as f: tasks = json.load(f)
+    kb = [[InlineKeyboardButton(f"❌ {t['name']}", callback_data=f"del_task_{i}")] for i, t in enumerate(tasks)]
+    await update.message.reply_text("📋 <b>Tasks:</b>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
+async def task_callback(update, context):
+    q = update.callback_query
+    await q.answer()
+    if q.data.startswith("del_task_"):
+        idx = int(q.data.split("_")[-1])
+        import json
+        with open(TASKS_FILE, 'r') as f: tasks = json.load(f)
+        if 0 <= idx < len(tasks):
+            t = tasks.pop(idx); json.dump(tasks, open(TASKS_FILE, 'w'), indent=4)
+            await q.edit_message_text(f"✅ Deleted: {t['name']}")
 
-async def post_init(application):
+async def update_cmd(update, context):
+    if is_not_user(update): return
+    msg = await update.message.reply_text("🔄 Updating...")
+    p = await asyncio.create_subprocess_shell("npm install -g @google/gemini-cli@nightly")
+    await p.wait()
+    await msg.edit_text("✅ Updated! Restarting...")
+    os.execv(sys.executable, ['python'] + sys.argv)
+
+async def post_init(app):
     global GLOBAL_APPLICATION
-    GLOBAL_APPLICATION = application
-    commands = [BotCommand("start", "Menu"), BotCommand("chat", "Sessions"), BotCommand("tasks", "Tasks"), BotCommand("status", "Status"), BotCommand("update", "Update"), BotCommand("stop", "Stop")]
-    await application.bot.set_my_commands(commands)
-    if hasattr(application, "scheduler_func") and application.scheduler_func: asyncio.create_task(application.scheduler_func(trigger_scheduled_task))
+    GLOBAL_APPLICATION = app
+    commands = [BotCommand("start", "Menu principal"), BotCommand("clear", "Nouvelle session"), BotCommand("chat", "Sessions"), BotCommand("tasks", "Tasks"), BotCommand("status", "Status"), BotCommand("stop", "Stop")]
+    await app.bot.set_my_commands(commands)
+    if hasattr(app, "scheduler_func"): asyncio.create_task(app.scheduler_func(trigger_scheduled_task))
 
+async def clear_cmd(update, context):
+    if is_not_user(update): return
+    set_current_session(update.effective_chat.id, "fresh_session")
+    await update.message.reply_text("✨ <b>Nouvelle session démarrée !</b>", parse_mode="HTML")
+
+async def chat_cmd(update, context):
+    if is_not_user(update): return
+    try:
+        res = subprocess.check_output(["gemini", "--list-sessions"], text=True, stderr=subprocess.STDOUT)
+        await update.message.reply_text(f"📋 <b>Sessions :</b>\n<pre>{html.escape(res)}</pre>", parse_mode="HTML")
+    except: await update.message.reply_text("Aucune session trouvée.")
+
+async def error_handler(update, context): logger.error(f"TG Error: {context.error}")
 
 def run_bot(scheduler_func=None):
-    application = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
-    application.scheduler_func = scheduler_func
-    application.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("<b>Ready!</b>", parse_mode="HTML", reply_markup=ReplyKeyboardMarkup([['/chat', '/tasks', '/status'], ['/update', '/stop']], resize_keyboard=True, is_persistent=True)), block=False))
-    application.add_handler(CommandHandler("stop", stop_cmd, block=False))
-    application.add_handler(CommandHandler("status", status_cmd, block=False))
-    application.add_handler(CommandHandler("chat", chat_cmd, block=False))
-    application.add_handler(CommandHandler("tasks", tasks_cmd, block=False))
-    application.add_handler(CommandHandler("update", update_cmd, block=False))
-    application.add_handler(CallbackQueryHandler(task_callback))
-    application.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), handle_message, block=False))
-    application.add_error_handler(error_handler)
-    application.run_polling()
+    app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
+    app.scheduler_func = scheduler_func
+    menu = ReplyKeyboardMarkup([['/clear', '/chat'], ['/tasks', '/status'], ['/stop']], resize_keyboard=True)
+    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("<b>Ready!</b>", parse_mode="HTML", reply_markup=menu)))
+    app.add_handler(CommandHandler("clear", clear_cmd))
+    app.add_handler(CommandHandler("stop", stop_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("chat", chat_cmd))
+    app.add_handler(CommandHandler("tasks", tasks_cmd))
+    app.add_handler(CommandHandler("update", update_cmd))
+    app.add_handler(CallbackQueryHandler(task_callback))
+    app.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), handle_message, block=False))
+    app.add_error_handler(error_handler)
+    app.run_polling()
