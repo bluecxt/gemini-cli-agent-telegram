@@ -1,5 +1,5 @@
 """
-Telegram Handler - Manages user interaction and Gemini streaming.
+Telegram Handler - Floating cursor and robust sequential results.
 """
 
 import asyncio
@@ -39,7 +39,6 @@ WHISPER_MODEL = whisper.load_model("tiny")
 
 CHAT_LOCKS = {}
 GLOBAL_APPLICATION = None
-ACTIVE_STATUS_MSGS = {}  # chat_id: Message object
 
 TOOL_MAPPING = {
     "list_directory": "ReadFolder",
@@ -142,27 +141,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _process_request(chat_id, user_input, origin_message=None):
     STOP_SIGNAL[chat_id] = False
     
-    async def send_msg(text, silent=True):
-        try:
-            if origin_message: return await origin_message.reply_text(text, parse_mode="HTML", disable_notification=silent)
-            return await GLOBAL_APPLICATION.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", disable_notification=silent)
-        except Exception as e:
-            logger.error(f"TG Send Error: {e}")
-            if origin_message: return await origin_message.reply_text(text[:4000], disable_notification=silent)
-            return await GLOBAL_APPLICATION.bot.send_message(chat_id=chat_id, text=text[:4000], disable_notification=silent)
+    async def send_msg(text, silent=True, noisy=False):
+        """Robust permanent delivery with retry."""
+        disable_notif = silent if not noisy else False
+        for attempt in range(3):
+            try:
+                if origin_message: return await origin_message.reply_text(text, parse_mode="HTML", disable_notification=disable_notif)
+                return await GLOBAL_APPLICATION.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", disable_notification=disable_notif)
+            except Exception as e:
+                if attempt == 2:
+                    logger.error(f"TG Send Error: {e}")
+                    if origin_message: return await origin_message.reply_text(text[:4000])
+                    return await GLOBAL_APPLICATION.bot.send_message(chat_id=chat_id, text=text[:4000])
+                await asyncio.sleep(1)
 
-    # Floating Cursor
-    cursor_msg = await send_msg("🤔 <b>Thinking...</b>")
+    # Thinking cursor
+    cursor_msg = await send_msg("🤔 <b>Thinking...</b>", silent=True)
 
-    current_buffer, full_response, last_update_time = "", "", 0
-    assistant_msg = None
-    active_tools = {} # tid -> {msg_obj, header, output}
+    current_buffer, full_response = "", ""
+    active_tools = {} # tid -> {header, output}
     final_stats = None
 
     async def rotate_cursor():
+        """Refreshes the bottom cursor."""
         nonlocal cursor_msg
         old = cursor_msg
-        cursor_msg = await send_msg("🤔 <b>Thinking...</b>")
+        cursor_msg = await send_msg("🤔 <b>Thinking...</b>", silent=True)
         try: await old.delete()
         except: pass
 
@@ -180,34 +184,20 @@ async def _process_request(chat_id, user_input, origin_message=None):
                 except: pass
 
     async def callback(e_type, e_data):
-        nonlocal current_buffer, full_response, cursor_msg, last_update_time, assistant_msg, active_tools, final_stats
+        nonlocal current_buffer, full_response, cursor_msg, active_tools, final_stats
         if STOP_SIGNAL.get(chat_id): return
 
         if e_type == "message" and e_data.get("role") == "assistant":
             content = e_data.get("content", "")
             if not content: return
-            
-            if not assistant_msg:
-                assistant_msg = await send_msg("▌")
-                await rotate_cursor()
-            
             current_buffer += content
             full_response += content
 
-            now = asyncio.get_event_loop().time()
-            if now - last_update_time > 1.5 and current_buffer:
-                clean = _format_html_response(current_buffer)
-                if clean:
-                    try: await assistant_msg.edit_text(f"{clean} ▌", parse_mode="HTML")
-                    except: pass
-                    last_update_time = now
-
         elif e_type == "tool_use":
-            if assistant_msg and current_buffer:
-                try: await assistant_msg.edit_text(_format_html_response(current_buffer), parse_mode="HTML")
-                except: pass
+            if current_buffer.strip():
+                await send_msg(_format_html_response(current_buffer))
+                await rotate_cursor()
             current_buffer = ""
-            assistant_msg = None
             clear_live_buffer(chat_id)
             
             name = e_data.get("tool_name") or e_data.get("name") or "tool"
@@ -220,27 +210,20 @@ async def _process_request(chat_id, user_input, origin_message=None):
 
             nick, icon = TOOL_MAPPING.get(name, name), TOOL_ICONS.get(name, "🛠️")
             p_val = params.get("command") or params.get("file_path") or params.get("dir_path") or ""
-            p_disp = html.escape((str(p_val)[:50] + "...") if len(str(p_val)) > 50 else str(p_val))
+            p_disp = html.escape((str(p_val)[:150] + "...") if len(str(p_val)) > 150 else str(p_val))
             header = f"{icon} {nick} <code>{p_disp}</code>"
             
-            tool_msg = await send_msg(header)
+            await send_msg(header)
             await rotate_cursor()
-            
-            active_tools[tid] = {"msg": tool_msg, "header": header, "output": ""}
+            active_tools[tid] = {"header": header, "output": "", "silent": False}
             conv_logger.info(f"TOOL [{chat_id}] {name}: {p_val}")
 
         elif e_type == "raw_stdout":
             content = e_data.get("content", "")
             if not active_tools: return
             last_tid = list(active_tools.keys())[-1]
-            t_info = active_tools[last_tid]
-            if t_info.get("silent"): return
-            
-            t_info["output"] += content + "\n"
-            lines = t_info["output"].strip().split("\n")
-            snippet = html.escape("\n".join(lines[-12:]))
-            try: await t_info["msg"].edit_text(f"{t_info['header']}\n<pre>{snippet}</pre>", parse_mode="HTML")
-            except: pass
+            if not active_tools[last_tid].get("silent"):
+                active_tools[last_tid]["output"] += content + "\n"
 
         elif e_type == "tool_result":
             tid = e_data.get("tool_id") or e_data.get("id")
@@ -248,28 +231,17 @@ async def _process_request(chat_id, user_input, origin_message=None):
             if not t_info and active_tools: t_info = list(active_tools.values())[-1]
             if not t_info or t_info.get("silent"): return
             
-            # Robust extraction of tool result output
             raw_out = e_data.get("output")
-            if (raw_out is None or (isinstance(raw_out, str) and not raw_out.strip())) and chat_id in LIVE_BUFFERS:
-                raw_out = "\n".join(list(LIVE_BUFFERS[chat_id]))
+            output = str(raw_out).strip() if (raw_out is not None and str(raw_out).strip()) else t_info.get("output", "").strip()
             
-            output = str(raw_out or "")
-            conv_logger.info(f"RESULT [{chat_id}] {tid}: {output[:500]}...")
+            conv_logger.info(f"RESULT [{chat_id}] {tid}: {output[:200]}...")
             await handle_images(output)
             clean_output = re.sub(r"\[SEND_IMAGE:.*?\]", "", output, flags=re.IGNORECASE)
             
-            if t_info["msg"]:
-                if clean_output.strip():
-                    lines = clean_output.strip().split("\n")
-                    safe = html.escape("\n".join(lines[-20:])) # More lines for result
-                    try: await t_info["msg"].edit_text(f"{t_info['header']}\n<pre>{safe}</pre>", parse_mode="HTML")
-                    except:
-                        try: await t_info["msg"].edit_text(f"{t_info['header']}\n{safe[:1000]}")
-                        except: pass
-                else:
-                    try: await t_info["msg"].edit_text(t_info['header'], parse_mode="HTML") # Remove ✅ here
-                    except: pass
-            assistant_msg = None
+            if clean_output:
+                safe = html.escape("\n".join(clean_output.split("\n")[-50:]))
+                await send_msg(f"<pre>{safe}</pre>")
+                await rotate_cursor()
 
         elif e_type == "result":
             final_stats = e_data.get("stats")
@@ -280,11 +252,13 @@ async def _process_request(chat_id, user_input, origin_message=None):
             await send_msg(f"{icon} <b>Quota/API {severity.capitalize()}:</b>\n<code>{html.escape(msg)}</code>")
             await rotate_cursor()
 
-    exit_code, final_stats = await call_gemini_stream(user_input, chat_id, callback)
+    # Run loop
+    exit_code, stats_from_stream = await call_gemini_stream(user_input, chat_id, callback)
+    final_stats = final_stats or stats_from_stream
 
-    if assistant_msg and current_buffer:
-        try: await assistant_msg.edit_text(_format_html_response(current_buffer), parse_mode="HTML")
-        except: pass
+    # Final assistant text
+    if current_buffer.strip():
+        await send_msg(_format_html_response(current_buffer))
     
     conv_logger.info(f"AGENT [{chat_id}]: {full_response}")
     if "[VOICE_TRANSCRIPTION]" in user_input and full_response:
@@ -298,7 +272,8 @@ async def _process_request(chat_id, user_input, origin_message=None):
         tokens, dur = final_stats.get("total_tokens", 0), final_stats.get("duration_ms", 0) / 1000
         if tokens > 0:
             txt = f"<code>💎 {tokens} tokens | ⏱️ {dur:.1f}s</code>"
-            await send_msg(txt)
+            await send_msg(txt, noisy=True)
+            conv_logger.info(f"STATS [{chat_id}]: {tokens} tokens")
 
 
 async def stop_cmd(update, context):

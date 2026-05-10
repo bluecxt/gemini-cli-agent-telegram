@@ -1,5 +1,5 @@
 """
-Gemini Engine - Core reasoning loop with robust event decoding.
+Gemini Engine - Core reasoning loop with line-buffering and robust capture.
 """
 
 import json
@@ -12,15 +12,15 @@ from .logger import logger
 
 ACTIVE_SUBPROCESSES = {}
 STOP_SIGNAL = {}
-LIVE_BUFFERS = {}  # chat_id: deque of strings
+LIVE_BUFFERS = {}
 
 SYSTEM_INSTRUCTIONS = """
 Tu es un agent autonome ultra-concis.
 
 RÈGLES ABSOLUES :
-1. ACTIONS : Pour voir des fichiers ou toute action système, tu DOIS utiliser un outil (`list_directory`, `run_shell_command`). INTERDICTION de deviner.
-2. RÉFLEXION : Analyse dans <thinking>...</thinking>.
-3. RÉPONSE : En dehors de <thinking>, écris uniquement en FRANÇAIS.
+1. ACTIONS : Pour voir des fichiers ou toute action système, tu DOIS utiliser un outil (`list_directory`, `run_shell_command`). INTERDICTION formelle de simuler ou deviner le résultat.
+2. RÉPONSE : Ne répète JAMAIS le contenu d'un résultat d'outil (comme un 'ls') dans ton texte. Le système s'en charge. Contente-toi de dire "Fait" ou d'analyser brièvement.
+3. RÉFLEXION : Toujours analyser dans <thinking>...</thinking>.
 4. HISTORIQUE : Documente tes changements dans `/app/workspace/HISTORY.md` via shell.
 5. IMAGES : [SEND_IMAGE: /chemin/vers/image.png]
 """
@@ -53,7 +53,7 @@ async def _read_stderr(stream, chat_id):
 
 async def get_short_summary(text):
     if not text or len(text) < 100: return text
-    prompt = f"Résume en une phrase : {text}"
+    prompt = f"Résume en une phrase courte : {text}"
     args = ["gemini", "--prompt", prompt, "--output-format", "text"]
     try:
         p = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -62,13 +62,21 @@ async def get_short_summary(text):
     except: return text[:200]
 
 async def call_gemini_stream(prompt, chat_id, callback):
-    """Loop with robust full-line JSON detection and stats recovery."""
+    """Reliable loop with stdbuf and stats tracking."""
     session_id = get_current_session(chat_id) or "latest"
     LIVE_BUFFERS[chat_id] = deque(maxlen=100)
     final_res_data = None
+    accumulated_stdout = []
 
     full_prompt = f"{SYSTEM_INSTRUCTIONS}\n\nUSER REQUEST: {prompt}"
-    args = ["gemini", "--prompt", "-", "--output-format", "stream-json", "--approval-mode", "yolo"]
+    
+    # Use stdbuf to ensure immediate output from gemini cli
+    args = [
+        "stdbuf", "-oL", "-eL",
+        "gemini", "--prompt", "-", 
+        "--output-format", "stream-json", 
+        "--approval-mode", "yolo"
+    ]
     if session_id and session_id != "fresh_session":
         args.extend(["--resume", session_id])
 
@@ -93,31 +101,35 @@ async def call_gemini_stream(prompt, chat_id, callback):
             raw_line = line.decode().strip()
             if not raw_line: continue
             
-            logger.debug(f"RAW_STDOUT [{chat_id}]: {raw_line}")
+            logger.debug(f"RAW [{chat_id}]: {raw_line}")
 
-            # Robust detection: If line starts with JSON signature, attempt full parse
-            if raw_line.startswith('{"type":'):
-                try:
-                    event = json.loads(raw_line)
-                    if event.get("type") == "init" and event.get("session_id"):
-                        set_current_session(chat_id, event.get("session_id"))
-                    
-                    if event.get("type") == "result":
-                        final_res_data = event.get("stats")
-                    
-                    await callback(event.get("type"), event)
-                    continue 
-                except json.JSONDecodeError:
-                    # If JSON is broken/mixed, try partial extraction
-                    match = re.search(r'(\{"type":.*?\})', raw_line)
-                    if match:
-                        try:
-                            event = json.loads(match.group(1))
-                            await callback(event.get("type"), event)
-                            continue
-                        except: pass
+            event = None
+            try:
+                start = raw_line.find('{"type":')
+                if start != -1:
+                    event = json.loads(raw_line[start:])
+            except: pass
 
-            # Treat as raw output (TTY/Bash/Logs)
+            if event:
+                e_type = event.get("type")
+                if e_type == "init" and event.get("session_id"):
+                    set_current_session(chat_id, event.get("session_id"))
+                
+                if e_type == "result":
+                    final_res_data = event.get("stats")
+                
+                if e_type == "tool_result" and not event.get("output") and accumulated_stdout:
+                    event["output"] = "\n".join(accumulated_stdout)
+                    accumulated_stdout = []
+
+                await callback(e_type, event)
+                
+                if e_type == "tool_use":
+                    accumulated_stdout = []
+                continue
+
+            # Non-JSON -> accumulated stdout
+            accumulated_stdout.append(raw_line)
             LIVE_BUFFERS[chat_id].append(raw_line)
             await callback("raw_stdout", {"content": raw_line})
 

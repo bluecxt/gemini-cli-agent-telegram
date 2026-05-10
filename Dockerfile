@@ -1,10 +1,12 @@
 # Lightweight base image with Python 3.11
 FROM python:3.11-slim
 
-# Install system dependencies (Node.js 20)
+# Install system dependencies (Node.js 20 and ffmpeg)
 RUN apt-get update && apt-get install -y \
     curl \
     gnupg \
+    git \
+    ffmpeg \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
     && apt-get clean \

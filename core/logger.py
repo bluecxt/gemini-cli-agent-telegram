@@ -50,4 +50,22 @@ def setup_logger():
     return logger
 
 
+def setup_conversation_logger():
+    """Configures a logger specifically for user/agent exchanges."""
+    logger = logging.getLogger("GeminiConversations")
+    logger.setLevel(logging.INFO)
+
+    formatter = logging.Formatter('%(asctime)s - %(message)s')
+
+    file_handler = RotatingFileHandler(
+        "logs/conversations.log", maxBytes=10*1024*1024, backupCount=10
+    )
+    file_handler.setFormatter(formatter)
+    
+    logger.addHandler(file_handler)
+    logger.propagate = False # Prevent messages from showing in Docker logs (stdout)
+    return logger
+
+
 logger = setup_logger()
+conv_logger = setup_conversation_logger()

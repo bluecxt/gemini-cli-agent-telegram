@@ -46,6 +46,16 @@ def native_read(path):
         return str(e)
 
 
+def append_history(content):
+    """Appends a line to the history file silently."""
+    try:
+        with open("HISTORY.md", "a") as f:
+            f.write(f"\n- {content}")
+        return "History updated."
+    except Exception as e:
+        return str(e)
+
+
 def write_log(msg):
     """Compatibility function for logging."""
     logger.info(msg)
